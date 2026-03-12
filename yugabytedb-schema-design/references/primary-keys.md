@@ -34,7 +34,7 @@ CREATE TABLE orders (
 );
 ```
 
-### Rule 2: Match the PK to the Most Common Access Pattern
+### Rule 2: Match the PK to the Most Common Access Pattern. Prefer business key over surrogate
 
 ```sql
 -- If you almost always query by email:
@@ -76,7 +76,7 @@ CREATE TABLE events (
 );
 ```
 
-Note: If you need range queries on a monotonically increasing column, follow the hotspot prevention patterns.
+Note: If you need to support range queries on a monotonically increasing column, follow the hotspot prevention patterns outlined in `hotspots.md`.
 
 ---
 

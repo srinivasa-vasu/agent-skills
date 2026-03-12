@@ -1,5 +1,5 @@
 ---
-name: yugabytedb-best-practices
+name: yugabytedb-schema-design
 description: >
   Best practices for designing high-performance YugabyteDB schemas from scratch or optimizing
   existing ones. Covers hash vs range sharding decisions, avoiding write hotspots on sequential

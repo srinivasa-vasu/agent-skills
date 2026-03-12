@@ -70,8 +70,7 @@ CREATE INDEX idx_orders_created ON orders(created_at ASC);
 
 ## Enhanced PostgreSQL Compatibility Mode
 
-In **Enhanced PostgreSQL Compatibility mode**, the default sharding strategy for secondary
-indexes changes from HASH to RANGE. Check whether your cluster has this enabled before
+In **Enhanced PostgreSQL Compatibility mode**, the default sharding strategy changes from HASH to RANGE. Check whether your cluster has this enabled before
 deciding whether to explicitly specify `ASC`/`DESC`.
 
 ## Composite Sharding Keys

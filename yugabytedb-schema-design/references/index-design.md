@@ -6,7 +6,7 @@ Every secondary index has three types of columns:
 
 | Role | Purpose | How to specify |
 |---|---|---|
-| **Sharding key** | Determines which tablet a row goes to | First column(s), `HASH` or default |
+| **Sharding key** | Determines which tablet a row goes to | First column(s), `HASH` or `ASC/DESC` |
 | **Clustering key** | Sort order within each tablet | `ASC` or `DESC` suffix |
 | **Covering columns** | Included for index-only scans, no lookup needed | `INCLUDE (col1, col2)` |
 
@@ -29,7 +29,6 @@ CREATE INDEX idx_orders_customer ON orders(
 ```sql
 -- ❌ Low-cardinality first → poor distribution
 CREATE INDEX idx ON orders(status, customer_id);
--- "status" has 5 values → max 5 tablets used
 
 -- ✅ High-cardinality first → even distribution
 CREATE INDEX idx ON orders(customer_id, status);
@@ -47,7 +46,7 @@ CREATE INDEX idx_products_price ON products(price DESC);  -- RANGE sharded
 CREATE INDEX idx_orders_customer ON orders(customer_id);  -- HASH sharded (default)
 ```
 
-Note: For range queries, the `ASC`/`DESC` suffix forces RANGE sharding, which is optimized for range scans but can lead to hotspots if the column is monotonically increasing. Follow the hotspot prevention patterns if using RANGE sharding on such columns.
+Note: For range queries, the `ASC`/`DESC` suffix forces RANGE sharding, which is optimized for range scans but can lead to hotspots if the column is monotonically increasing. Apply the hotspot prevention patterns if using RANGE sharding on such columns.
 
 ---
 

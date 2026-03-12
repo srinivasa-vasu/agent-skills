@@ -6,8 +6,7 @@ YugabyteDB's default HASH sharding distributes rows across tablets by hashing th
 key. If the sharding key has very few distinct values, the hash function can only produce a
 small number of distinct hash outputs — limiting data to a small number of tablets.
 
-**Example**: A boolean column has 2 values → maximum 2 tablets used, no matter how large the table.
-An ENUM with 5 values → maximum 5 tablets.
+**Example**: A boolean column with 2 values. An ENUM with 5 values.
 
 This creates both a distribution problem (uneven data) and a scalability ceiling.
 
@@ -112,13 +111,9 @@ CREATE INDEX idx_dow ON schedule(day_of_week ASC, start_time ASC);
 
 ## Summary Decision Tree
 
-```
-Is the column low-cardinality?
-├── Yes → Will ALL distinct values appear in queries?
-│   ├── Yes (e.g., need to query all statuses)
-│   │   ├── Is there a high-cardinality column to pair with? → Reorder (high-card first)
-│   │   └── No pairing column → Force range sharding with ASC
-│   └── No (some values never/rarely queried)
-│       └── Use partial indexes, one per queried value
-└── No → Standard index design (see index-design.md)
-```
+| Low-Cardinality? | All Distinct Values Queried? | High-Cardinality Pairing Column? | Recommendation |
+|---|---|---|---|
+| Yes | Yes | Yes | Reorder: high-cardinality column first |
+| Yes | Yes | No | Force range sharding with a high cardinality composite column key |
+| Yes | No (some values never/rarely queried) | — | Use partial indexes, one per queried value |
+| No | — | — | Standard index design (see [index-design.md](index-design.md)) |

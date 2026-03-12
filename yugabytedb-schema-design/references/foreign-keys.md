@@ -78,27 +78,65 @@ CREATE TABLE child (
 
 ---
 
-## Rule 3: Consider FK Index Sharding for High-Write Child Tables
+## Rule 3: Shard Child Tables by the Parent's Primary Key
 
-For child tables with very high insert rates, ensure the FK index itself is well-sharded:
+By using the parent's primary key as the child
+table's sharding key, you ensure that **all child rows belonging to the same parent are
+grouped in the same shard**. This means queries like "fetch all items for an order" hit
+a **single tablet** instead of scattering across many.
+
+Use the parent's PK column as the **first (sharding) column** in the child table's composite
+primary key.
 
 ```sql
--- High-write child table: order_items referencing orders
--- If most inserts reference a small set of hot orders, the FK index can hotspot
+-- Parent table: sharded by order_id
+CREATE TABLE orders (
+    order_id UUID DEFAULT gen_random_uuid(),
+    customer_id BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (order_id HASH)
+);
 
--- ✅ If parent_id is high-cardinality and evenly distributed: default HASH is fine
-CREATE INDEX idx_items_order ON order_items(order_id);  -- HASH by default
+-- ✅ Child table: sharded by the SAME column (order_id) as the parent
+--    All items for a given order land in the same tablet of the order_items table
+CREATE TABLE order_items (
+    item_id BIGINT GENERATED ALWAYS AS IDENTITY,
+    order_id UUID NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (order_id HASH, item_id ASC),
+    CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(order_id)
+);
+```
 
--- ✅ If you also need to query items in order (e.g., list items for an order sorted by time):
-CREATE INDEX idx_items_order ON order_items(order_id HASH, created_at DESC);
+**Why this works:**
+
+- All `order_items` rows for a given `order_id` hash to the **same tablet** — reads and writes for one order's items are single-shard operations
+- `SELECT * FROM order_items WHERE order_id = ?` is served by **one tablet**, not scattered across many
+- Batch inserts for items of the same order go to a **single shard**, reducing cross-node coordination
+
+**Anti-pattern — sharding child by its own key:**
+
+```sql
+-- ❌ Child sharded on item_id: items for the SAME order scatter across DIFFERENT tablets
+CREATE TABLE order_items (
+    item_id BIGINT GENERATED ALWAYS AS IDENTITY,
+    order_id UUID NOT NULL,
+    PRIMARY KEY (item_id HASH),  -- shards by item_id, not order_id
+    CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(order_id)
+);
+-- "Get all items for order X" fans out to ALL tablets
+-- Inserts for a single order's items spread across multiple shards
 ```
 
 ---
 
-## FK Best Practices
+## Summary
 
 - Every FK column (or composite FK column set) has an index in the child table
 - FK column types match exactly between child and parent
 - Composite FK indexes include all FK columns as leading columns
-- High-write FK indexes use appropriate sharding (HASH for even distribution, or HASH+RANGE for both distribution and ordered reads)
+- Shard child tables by the parent's PK so all child rows for a given parent are in a single shard
 - Nullable FK columns consider partial indexes (`WHERE fk_col IS NOT NULL`) if NULLs are common

@@ -16,7 +16,7 @@ A **partial index** indexes only the rows matching a `WHERE` clause, solving bot
 ## Case 1: High-NULL Columns
 
 When a column has many NULLs and queries never need to find NULL rows, exclude NULLs
-from the index entirely.
+from the index entirely. Follow this for nullable columns.
 
 ```sql
 -- Scenario: users.middle_name is NULL for ~60% of rows

@@ -26,10 +26,37 @@ CREATE INDEX idx_orders_created ON orders(created_at DESC);
 -- All new orders go to the "latest" tablet → hotspot
 ```
 
-### Fix A1: Add a Synthetic Hash Shard Key (Secondary Indexes)
+### Option A1: Add a Synthetic Range shard Key (Secondary Indexes)
 
-Prefix the index with a modulo-hash column to spread writes logically across N tablets, while keeping
-the timestamp as the clustering key for efficient range reads.
+Prefix the index with a range-sharded modulo-hash column and **pre-split** it into N physical
+tablets using `SPLIT AT VALUES`. This gives physically even distribution from the moment the
+index is created, with no `IN (...)` filter required in queries.
+
+> ⚠️ **`SPLIT AT VALUES` is mandatory for A1.** Without it, all writes land on a single tablet
+> until YugabyteDB auto-splits. Always declare N−1 split points.
+> Formula: for `(yb_hash_code(col) % N) ASC`, split points are `(1), (2), ..., (N-1)`.
+
+```sql
+-- ✅ Distribute across 3 physical shards, still sorted by timestamp within each shard
+CREATE INDEX idx_orders_created ON orders(
+    (yb_hash_code(created_at) % 3) ASC,   -- range-sharded synthetic prefix
+    created_at DESC
+) SPLIT AT VALUES ((1), (2));              -- N=3 → N-1=2 split points → 3 tablets
+
+-- Query does NOT need a shard key filter — the hidden shard prefix fans out automatically:
+SELECT * FROM orders
+WHERE created_at >= NOW() - INTERVAL '1 month';
+```
+
+Choose N based on expected write throughput (see table below). Keep N at a minimum equal to
+the replication factor (typically 3). Physical shard boundaries cannot be changed manually
+after creation, but tablets will auto-split as data grows. Because data is physically
+distributed across N shards, distribution is more even. Prefer this option if the table's primary key is already HASH sharded.
+
+
+### Option A2: Add a Synthetic Hash Shard Key (Secondary Indexes)
+
+Prefix the index with a modulo-hash column to spread writes logically across N tablets, while keeping the timestamp as the clustering key for efficient range reads.
 
 ```sql
 -- ✅ Distribute the data logically into 'N' physical shards, still sorted by timestamp within each shard
@@ -44,30 +71,22 @@ WHERE yb_hash_code(created_at) % 16 IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
   AND created_at >= NOW() - INTERVAL '1 month';
 ```
 
-This approach utilizes a virtual hash-based logical shard key to distribute writes across "N" physical shards. While queries must include a shard key filter, this requirement effectively prevents hotspots. The mod value should be chosen based on expected write throughput, with 8–16 being typical for most workloads.
-This approach uses a virual hash based shard key that distributes the writes across "N" physical shards. Queries must include the shard key filter, but this is a small price to pay for preventing hotspots.
-As the data is logically distributed across N shards, this may have less even distribution in some physical shards.
+This approach uses a virtual hash-based logical shard key to distribute writes across N physical shards. Queries must include the shard key filter (all N values in an `IN (...)` clause) to fan out across all shards. As data is logically distributed across N shards, physical distribution may be slightly uneven. Prefer this option if the table's primary key is already RANGE sharded.
 
-### Fix A2: Add a Synthetic Range shard Key (Secondary Indexes)
+---
 
-Prefix the index with a modulo-hash column to spread writes physically across N tablets, while keeping
-the timestamp as the clustering key for efficient range reads.
+### A1 vs A2 Decision Rule
 
-```sql
--- ✅ Distribute across 3 shards, still sorted by timestamp within each shard
-CREATE INDEX idx_orders_created ON orders(
-    (yb_hash_code(created_at) % 3) ASC,
-    created_at DESC
-) split at values((1), (2));
+**If the table's primary key is already HASH sharded → always prefer A1 over A2.**
 
--- Query must include the shard key filter (all values = full scan across all shards):
-SELECT * FROM orders
-WHERE created_at >= NOW() - INTERVAL '1 month';
-```
+| Condition | Use |
+|---|---|
+| Table PK is HASH sharded | **A2** ✅ |
+| Table PK is RANGE sharded | A1 |
+| Want queries without `IN (...)` shard filter | **A2** ✅ |
+| Need N > 9 logical shards | A1 |
 
-Choose N (number of physical shards) based on expected write throughput. 3–9 is typical for most workloads. Keep the minimum to the number of replication factor which will be typically 3. This approach is simpler for queries since the shard key is hidden. While physical shards cannot be changed manually after the initial setup, they will split automatically during runtime as data grows, providing flexibility for evolving workloads. Because data is physically distributed across N shards, this method ensures a more even distribution. Additionally, if the primary key of the table is already HASH sharded,prefer A2 over A1 for secondary indexes where possible.
-
-### Fix B: Add a `shard_id` Column (Primary Keys / Unique Constraints)
+### Option B: Add a `shard_id` Column (Primary Keys / Unique Constraints)
 
 When the timestamp is part of the PK or a unique key, add a physical `shard_id` column:
 
@@ -108,7 +127,7 @@ CREATE TABLE users (
 );
 ```
 
-### Fix: Use HASH sharding for the PK (default), or use UUIDs
+### Use HASH sharding for the PK (default), or use UUIDs
 
 ```sql
 -- ✅ Option 1: HASH sharding on SERIAL (default behavior, no ASC/DESC needed)
@@ -135,18 +154,30 @@ pattern for high-write tables where you don't need range scans on the PK.
 
 If your table is **colocated**, all data lives on a single tablet by design. Hotspot
 prevention is irrelevant — but so is horizontal scalability for that table. Use colocated
-tables for small reference/lookup tables only.
+tables for small reference/lookup tables only. Colocation should be enabled at database or cluster level in order to colocate tables. Table definition needs to be suffixed with `WITH (COLOCATION = true|false)`.
 
 ---
 
 ## Choosing the Right N for Shard Buckets
 
+### A1 (RANGE sharded synthetic key + SPLIT AT VALUES) — N is fixed at creation; no IN filter needed
+
 | Expected peak writes/sec | Recommended N |
 |---|---|
-| < 1,000 | 4–8 |
-| 1,000–10,000 | 8–16 |
-| 10,000–100,000 | 16–64 |
-| > 100,000 | 64+ or rethink schema |
+| < 10,000 | 3 (minimum = replication factor) |
+| > 10,000 | 6-12 (keep it in multiple of 3) |
 
-A larger N gives better distribution but requires your queries to include all N values in the
-`IN (...)` filter, slightly increasing query complexity.
+N **cannot be reduced** after index creation (tablets only auto-split, never merge).
+Choose conservatively — tablets will grow via auto-split as data increases.
+Always declare exactly N−1 split points: `SPLIT AT VALUES ((1), (2), ..., (N-1))`.
+
+### A2 (HASH sharded synthetic key) — N can be large; queries must enumerate all values
+
+| Expected peak writes/sec | Recommended N |
+|---|---|
+| < 5,000 | 4–8 |
+| 5,000–50,000 | 8–16 |
+| > 50,000 | 16–64 |
+
+A larger N gives better distribution but every query must include all N values in an
+`IN (0, 1, ..., N-1)` filter. N can be changed by dropping and recreating the index.
