@@ -154,7 +154,7 @@ pattern for high-write tables where you don't need range scans on the PK.
 
 If your table is **colocated**, all data lives on a single tablet by design. Hotspot
 prevention is irrelevant — but so is horizontal scalability for that table. Use colocated
-tables for small reference/lookup tables only. Colocation should be enabled at database or cluster level in order to colocate tables. Table definition needs to be suffixed with `WITH (COLOCATION = true|false)`. `WITH (COLOCATION = true)` is the default in a colocated database. To exclude a table from colocation, use `WITH (COLOCATION = false)` explicitly.
+tables for small reference/lookup tables only. Colocation should be enabled at database or cluster level in order to colocate tables. Table definition needs to be suffixed with `WITH (COLOCATION = true|false)`. `WITH (COLOCATION = true)` is the default in a colocated database. To exclude a table from colocation, use `WITH (COLOCATION = false)` explicitly. It's recommended to explicitly specify `WITH (COLOCATION = true|false)` for tables.
 
 ---
 
