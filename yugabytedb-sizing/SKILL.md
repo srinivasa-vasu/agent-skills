@@ -28,11 +28,13 @@ This skill performs accurate YugabyteDB cluster sizing from workload inputs, pro
 | Table size (GB) | Required | Raw/uncompressed data size |
 | Avg row size (bytes) | Optional | Used for IOPS estimation; default 512 bytes if unknown |
 | Data growth rate (%/yr) | Optional | Used to project storage over 1–2 years; default 30%/yr if unknown |
+| CDC | Optional | Enable Change Data Capture — adds 5% CPU overhead by default (overridable) |
+| xCluster | Optional | Enable cross-cluster replication — adds 5% CPU overhead by default (overridable) |
 
 ### Fixed / Default Values
 | Parameter | Value | Notes |
 |---|---|---|
-| RPC, Retries and Index lookups | 1.2 | Covers joins, index lookups, retry overhead |
+| RPC, Retries and Index lookups | 0.20 (fraction) | Applied as `1.0 + 0.20 = 1.2×` multiplier; covers joins, index lookups, retry overhead |
 | Index Storage Overhead | 20% | Additional storage for indexes |
 | Compression ratio | 30% reduction | YugabyteDB LZ4 compression applied to storage |
 | WAL Overhead | 10% | Write-Ahead Log storage on top of compressed+replicated data |
@@ -47,6 +49,8 @@ This skill performs accurate YugabyteDB cluster sizing from workload inputs, pro
 | Default data growth rate | 30% per year | Used for storage projection if not provided |
 | IOPS per write op | RF writes to disk per op | Each write op = RF SSTable writes |
 | Network overhead factor | 2× write Ops/s | Inter-node Raft traffic ≈ 2× write ops for RF=3 |
+| CDC CPU overhead | 5% | Additional processing overhead when CDC is enabled (overridable via `--cdc-overhead`) |
+| xCluster CPU overhead | 5% | Additional processing overhead when xCluster is enabled (overridable via `--xcluster-overhead`) |
 
 ### Avg Execution Time — Fallback When Unknown
 
@@ -95,10 +99,22 @@ python3 scripts/sizing_calc.py \
   --table-size-gb <value>
 ```
 
+### With CDC and/or xCluster overhead
+```bash
+# Enable CDC (default +5% CPU overhead)
+python3 scripts/sizing_calc.py ... --cdc
+
+# Enable xCluster (default +5% CPU overhead)
+python3 scripts/sizing_calc.py ... --xcluster
+
+# Both enabled with custom overrides
+python3 scripts/sizing_calc.py ... --cdc --cdc-overhead 0.08 --xcluster --xcluster-overhead 0.06
+```
+
 ### Try multiple vCPU tiers to find the optimal fit
 ```bash
 for vcpu in 8 16 32; do
-  echo "=== ${vcpu} vCPU/node ===" 
+  echo "=== ${vcpu} vCPU/node ==="
   python3 scripts/sizing_calc.py --qps 10000 --write-pct 30 --read-pct 70 \
     --avg-exec-ms 5 --vcpu-per-node $vcpu --rf 3 --table-size-gb 500
 done
@@ -107,6 +123,8 @@ done
 ### Override any fixed parameter if needed
 ```bash
 python3 scripts/sizing_calc.py ... --target-cpu-util 0.70 --conn-per-vcpu 16
+# rpc-overhead is a fraction: 0.20 = 20% overhead → 1.20× multiplier
+python3 scripts/sizing_calc.py ... --rpc-overhead 0.25
 ```
 
 ### JSON output (for programmatic use)
@@ -133,10 +151,13 @@ Read Ops/s  = QPS × (Read%  / 100)
 ### Step 2: Apply Overhead Multiplier
 YugabyteDB uses Raft replication + DocDB RPC internally. Account for this:
 ```
-Effective Write Ops/s = Write Ops/s × RF × RPC_Overhead
-Effective Read Ops/s  = Read Ops/s  × RPC_Overhead
+RPC Multiplier        = 1.0 + rpc_overhead          (e.g. 1.0 + 0.20 = 1.2×)
+Effective Write Ops/s = Write Ops/s × RF × RPC Multiplier
+Effective Read Ops/s  = Read Ops/s  × RPC Multiplier
 Total Effective Ops/s = Effective Write Ops/s + Effective Read Ops/s
 ```
+`rpc_overhead` is expressed as a fraction (default `0.20`), consistent with all other overhead
+parameters. The effective multiplier is always `1.0 + rpc_overhead`.
 Note: Writes are multiplied by RF because each write is replicated to RF nodes.
 Reads go to the leader by default (RF not multiplied unless using follower reads).
 
@@ -264,6 +285,28 @@ Storage after 2 yr/node     = storage_per_node × (1 + growth_rate)²
 Present the 2-year projection alongside the current recommendation so the user can provision
 storage volumes that won't require resizing soon after launch.
 
+### Step 11: Failure Resilience — CPU Utilization Under Node/Zone Loss
+
+Always compute and report what CPU utilisation looks like if a single node or an entire zone goes down. Zones are aligned to RF: assume one AZ per replica, nodes distributed evenly across zones.
+
+```
+Zones               = RF   (e.g. RF=3 → 3 AZs)
+Nodes per zone      = Total nodes / RF   (integer, nodes distributed evenly)
+
+── 1-node failure ──
+Surviving nodes           = Total nodes − 1
+Surviving total vCPU      = Surviving nodes × vCPU/node
+Surviving connection CPU  = conn_cpu_per_node × Surviving nodes
+Surviving effective vCPUs = raw_vcpus_workload + Surviving connection CPU
+CPU utilisation           = Surviving effective vCPUs / Surviving total vCPU
+
+── 1-zone failure ──
+Surviving nodes           = Total nodes − Nodes_per_zone
+(same formula as above with Surviving nodes)
+```
+
+Flag with ⚠️ if either scenario exceeds the 65% target. If so, advise adding nodes in RF multiples.
+
 ---
 
 ## Output Format
@@ -284,6 +327,8 @@ INPUT SUMMARY
   Table size:             {value} GB
   Avg row size:           {value} bytes  ({provided | default 512})
   Data growth rate:       {value}%/yr   ({provided | default 30%})
+  CDC:                    enabled  (+{N}% CPU overhead)   ← only if enabled
+  xCluster:               enabled  (+{N}% CPU overhead)   ← only if enabled
 
 DERIVED WORKLOAD
 ────────────────
@@ -313,6 +358,19 @@ PER-NODE OPERATIONAL LIMITS
   CPU Utilization:        {value}%  ✅ (target ≤65%)
   Est. IOPS/node:         {value}  (provision ≥ this; NVMe recommended if >10,000)
   Est. Network/node:      {value} MB/s  (keep below 40% of NIC capacity)
+
+FAILURE RESILIENCE  (zone layout: RF={RF} zones × {N} nodes/zone)
+──────────────────────────────────────────────────────────────────
+  Normal (all {N} nodes):         {value}%  ✅
+
+  1-node failure  ({N-1} nodes survive):
+    CPU Utilization:              {value}%  ✅ within target  |  ⚠️ EXCEEDS TARGET
+
+  1-zone failure  ({N - nodes_per_zone} nodes survive, {nodes_per_zone} node(s) lost):
+    CPU Utilization:              {value}%  ✅ within target  |  ⚠️ EXCEEDS TARGET
+
+  [If any scenario exceeds 65%]
+  💡 Consider adding nodes (in multiples of RF) to stay within 65% under failure.
 
 NOTES
 ─────
@@ -359,6 +417,7 @@ These are approximate — actual throughput depends on operation complexity, row
 
 ```
 Write Ops/s = 3,000 | Read Ops/s = 7,000
+RPC Multiplier = 1.0 + 0.20 = 1.2×
 Eff. Writes = 3,000 × 3 × 1.2 = 10,800
 Eff. Reads  = 7,000 × 1.2     =  8,400
 Total Eff.  = 19,200 ops/s
@@ -414,4 +473,10 @@ Memory (read-heavy 70%, 16 vCPU, 512 connections/node):
 PG Connections/node: 32 × 16 = 512
 DB Ops/node: 19,200 / 24 = 800 ops/s/node
 Total Memory: 192 × 24 = 4,608 GB
+
+Failure Resilience (RF=3 zones, 24 nodes → 8 nodes/zone):
+  Normal (24 nodes):        64%  ✅
+  1-node failure (23 nodes): effective_vcpus / (23 × 16) → ~66%  ⚠️ EXCEEDS TARGET
+  1-zone failure (16 nodes): effective_vcpus / (16 × 16) → ~95%  ⚠️ EXCEEDS TARGET
+  → Recommend adding 3 more nodes (RF multiple) to provide comfortable failure headroom.
 ```

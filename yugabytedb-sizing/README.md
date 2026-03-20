@@ -61,6 +61,11 @@ This skill activates when a user:
 
 > *"Size a YugabyteDB cluster for 8,000 QPS, 50/50 read-write, 16 vCPU, RF 3, 1 TB data. My data compresses ~50% with LZ4 and I want 40% compaction reserve."*
 
+**Sizing with CDC and xCluster** — the skill accounts for additional CPU overhead when Change Data Capture (CDC) or cross-cluster replication (xCluster) is enabled:
+
+> *"How many YugabyteDB nodes do I need for 50,000 QPS with a 60/40 read-write split on 2 TB of data with CDC and xCluster enabled?"*
+
+
 ## Required Inputs
 
 | Input | Description |
@@ -76,7 +81,7 @@ This skill activates when a user:
 
 | Parameter | Default | Notes |
 |---|---|---|
-| RPC overhead | 1.2× | Joins, index lookups, retry overhead |
+| RPC overhead | 20% | Joins, index lookups, retry overhead, auto-analyze |
 | Compression | 30% reduction | LZ4 compression |
 | Compaction reserve | 35% | LSM-tree compaction free space |
 | Target CPU utilization | 65% | Max sustained utilization |

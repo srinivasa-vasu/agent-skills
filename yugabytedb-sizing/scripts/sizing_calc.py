@@ -26,7 +26,7 @@ import sys
 
 # ─── Fixed Defaults ────────────────────────────────────────────────────────────
 DEFAULTS = {
-    "rpc_overhead":        1.2,    # RPC, retries, and indexes
+    "rpc_overhead":        0.20,   # 20% overhead fraction for RPC, retries, and indexes (applied as 1 + rpc_overhead)
     "index_overhead":      0.20,   # 20% extra storage for indexes
     "compression_ratio":   0.30,   # 30% compression reduction
     "wal_overhead":        0.10,   # 10% WAL storage overhead
@@ -40,6 +40,8 @@ DEFAULTS = {
     "avg_row_bytes":       512,    # Default avg row size if not provided
     "growth_rate_pct":     30,     # Annual data growth rate % if not provided
     "max_storage_per_node_gb": 20480,  # 20 TB max disk density per node
+    "cdc_overhead":         0.05,   # 5% extra CPU overhead when CDC is enabled
+    "xcluster_overhead":    0.05,   # 5% extra CPU overhead when xCluster is enabled
 }
 
 # Estimated avg execution time (ms) by workload profile when not provided by user
@@ -92,6 +94,10 @@ def calculate(
     conn_cpu_overhead=None,
     write_amp_factor=None,
     read_cache_miss=None,
+    cdc_enabled=False,
+    cdc_overhead=None,
+    xcluster_enabled=False,
+    xcluster_overhead=None,
 ):
     # Apply defaults for any unset overrides
     rpc_overhead       = rpc_overhead       or DEFAULTS["rpc_overhead"]
@@ -108,6 +114,8 @@ def calculate(
     avg_row_bytes      = avg_row_bytes      or DEFAULTS["avg_row_bytes"]
     growth_rate_pct    = growth_rate_pct    if growth_rate_pct is not None else DEFAULTS["growth_rate_pct"]
     max_storage_per_node_gb = max_storage_per_node_gb or DEFAULTS["max_storage_per_node_gb"]
+    cdc_overhead       = cdc_overhead       if cdc_overhead       is not None else DEFAULTS["cdc_overhead"]
+    xcluster_overhead  = xcluster_overhead  if xcluster_overhead  is not None else DEFAULTS["xcluster_overhead"]
 
     # ── Exec time: estimate if not provided ────────────────────────────────
     exec_time_estimated = avg_exec_ms is None
@@ -124,12 +132,22 @@ def calculate(
     read_ops  = qps * (read_pct  / 100)
 
     # ── Step 2: Apply overhead multiplier ──────────────────────────────────
-    eff_write_ops = write_ops * rf * rpc_overhead
-    eff_read_ops  = read_ops  * rpc_overhead
+    rpc_multiplier = 1.0 + rpc_overhead
+    eff_write_ops = write_ops * rf * rpc_multiplier
+    eff_read_ops  = read_ops  * rpc_multiplier
     total_eff_ops = eff_write_ops + eff_read_ops
 
     # ── Step 3: CPU required for workload ──────────────────────────────────
     cpu_seconds_needed = total_eff_ops * (avg_exec_ms / 1000)
+
+    # ── CDC / xCluster overhead ────────────────────────────────────────────
+    # Each enabled feature adds a percentage overhead on top of the base CPU workload.
+    feature_overhead_factor = 1.0
+    if cdc_enabled:
+        feature_overhead_factor += cdc_overhead
+    if xcluster_enabled:
+        feature_overhead_factor += xcluster_overhead
+    cpu_seconds_needed = cpu_seconds_needed * feature_overhead_factor
 
     # ── Step 4 + 5: Iterative node sizing with connection overhead ─────────
     conn_per_node     = conn_per_vcpu * vcpu_per_node
@@ -222,6 +240,41 @@ def calculate(
     storage_2yr = storage_per_node * (1 + growth) ** 2
     total_storage_2yr = storage_2yr * total_nodes
 
+    # ── Step 11: Failure scenario CPU projections ──────────────────────────
+    # Zones are aligned to RF: one zone per RF replica, nodes spread evenly.
+    num_zones        = rf                                         # zones = RF
+    nodes_per_zone   = total_nodes // num_zones                  # evenly distributed
+
+    def _cpu_util_with_nodes(surviving):
+        """CPU utilisation when only `surviving` nodes remain (same workload)."""
+        if surviving <= 0:
+            return None
+        sv_total_vcpu      = surviving * vcpu_per_node
+        sv_total_conn_cpu  = conn_cpu_per_node * surviving
+        sv_eff_vcpus       = raw_vcpus_workload + sv_total_conn_cpu
+        return round(sv_eff_vcpus / sv_total_vcpu * 100, 1)
+
+    nodes_after_node_failure = total_nodes - 1
+    nodes_after_zone_failure = total_nodes - nodes_per_zone
+
+    cpu_util_node_failure = _cpu_util_with_nodes(nodes_after_node_failure)
+    cpu_util_zone_failure = _cpu_util_with_nodes(nodes_after_zone_failure)
+
+    failure_scenarios = {
+        "num_zones": num_zones,
+        "nodes_per_zone": nodes_per_zone,
+        "node_failure": {
+            "surviving_nodes": nodes_after_node_failure,
+            "cpu_util_pct": cpu_util_node_failure,
+            "exceeds_target": cpu_util_node_failure is not None and cpu_util_node_failure > target_cpu_util * 100,
+        },
+        "zone_failure": {
+            "surviving_nodes": nodes_after_zone_failure,
+            "cpu_util_pct": cpu_util_zone_failure,
+            "exceeds_target": cpu_util_zone_failure is not None and cpu_util_zone_failure > target_cpu_util * 100,
+        },
+    }
+
     # ── Assemble result ────────────────────────────────────────────────────
     result = {
         "inputs": {
@@ -238,9 +291,12 @@ def calculate(
             "avg_row_bytes_source": "provided" if avg_row_bytes != DEFAULTS["avg_row_bytes"] else "default",
             "growth_rate_pct": growth_rate_pct,
             "growth_rate_source": "provided" if growth_rate_pct != DEFAULTS["growth_rate_pct"] else "default",
+            "cdc_enabled": cdc_enabled,
+            "xcluster_enabled": xcluster_enabled,
         },
         "parameters": {
             "rpc_overhead": rpc_overhead,
+            "rpc_multiplier": rpc_multiplier,
             "index_overhead_pct": index_overhead * 100,
             "compression_pct": compression_ratio * 100,
             "wal_overhead_pct": wal_overhead * 100,
@@ -250,6 +306,9 @@ def calculate(
             "mem_mb_per_conn": mem_mb_per_conn,
             "write_amp_factor": write_amp_factor,
             "read_cache_miss_pct": read_cache_miss * 100,
+            "cdc_overhead_pct": cdc_overhead * 100 if cdc_enabled else None,
+            "xcluster_overhead_pct": xcluster_overhead * 100 if xcluster_enabled else None,
+            "feature_overhead_factor": round(feature_overhead_factor, 4),
         },
         "workload": {
             "write_ops_per_s": round(write_ops, 1),
@@ -306,6 +365,7 @@ def calculate(
             "total_net_mbps_per_node": round(total_net_mbps, 2),
             "note": "Keep below 40% of NIC capacity (e.g. 4,000 MB/s on 10 GbE).",
         },
+        "failure_scenarios": failure_scenarios,
     }
     return result
 
@@ -341,13 +401,26 @@ def format_report(r):
         f"  Table size:                  {i['table_size_gb']:,} GB",
         f"  Avg row size:                {i['avg_row_bytes']} bytes  ({i['avg_row_bytes_source']})",
         f"  Data growth rate:            {i['growth_rate_pct']}%/yr  ({i['growth_rate_source']})",
+    ]
+
+    feature_lines = []
+    if i.get("cdc_enabled"):
+        pct = r["parameters"]["cdc_overhead_pct"]
+        feature_lines.append(f"  CDC:                         enabled  (+{pct:.0f}% CPU overhead)")
+    if i.get("xcluster_enabled"):
+        pct = r["parameters"]["xcluster_overhead_pct"]
+        feature_lines.append(f"  xCluster:                    enabled  (+{pct:.0f}% CPU overhead)")
+    if feature_lines:
+        lines += feature_lines
+
+    lines += [
         "",
         "DERIVED WORKLOAD",
         "─" * 44,
         f"  Write Ops/s:                 {w['write_ops_per_s']:,}",
         f"  Read Ops/s:                  {w['read_ops_per_s']:,}",
-        f"  Effective Write Ops/s:       {w['eff_write_ops_per_s']:,}  (×RF×{r['parameters']['rpc_overhead']} overhead)",
-        f"  Effective Read Ops/s:        {w['eff_read_ops_per_s']:,}  (×{r['parameters']['rpc_overhead']} overhead)",
+        f"  Effective Write Ops/s:       {w['eff_write_ops_per_s']:,}  (×RF×{r['parameters']['rpc_multiplier']} RPC overhead)",
+        f"  Effective Read Ops/s:        {w['eff_read_ops_per_s']:,}  (×{r['parameters']['rpc_multiplier']} RPC overhead)",
         f"  Total Effective Ops/s:       {w['total_eff_ops_per_s']:,}",
         f"  vCPUs needed (workload):     {w['raw_vcpus_workload_only']}",
         "",
@@ -423,6 +496,33 @@ def format_report(r):
         lines.append("   FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 20;")
         lines.append("")
 
+    # ── Failure resilience section ─────────────────────────────────────────
+    fs  = r["failure_scenarios"]
+    nf  = fs["node_failure"]
+    zf  = fs["zone_failure"]
+
+    def _util_badge(exceeds):
+        return "⚠️  EXCEEDS TARGET" if exceeds else "✅ within target"
+
+    lines += [
+        "FAILURE RESILIENCE  (zone layout: RF={rf} zones × {npz} nodes/zone)".format(
+            rf=fs["num_zones"], npz=fs["nodes_per_zone"]
+        ),
+        "─" * 44,
+        f"  Normal (all {c['total_nodes']} nodes):          {c['cpu_utilization_pct']}%  ✅",
+        "",
+        f"  1-node failure  ({nf['surviving_nodes']} nodes survive):",
+        f"    CPU Utilization:           {nf['cpu_util_pct']}%  {_util_badge(nf['exceeds_target'])}",
+        "",
+        f"  1-zone failure  ({zf['surviving_nodes']} nodes survive, {fs['nodes_per_zone']} node(s) lost):",
+        f"    CPU Utilization:           {zf['cpu_util_pct']}%  {_util_badge(zf['exceeds_target'])}",
+        "",
+    ]
+
+    if nf["exceeds_target"] or zf["exceeds_target"]:
+        lines.append("  💡 Consider adding nodes (in multiples of RF) to stay within 65% under failure.")
+        lines.append("")
+
     lines.append("═" * 56)
     return "\n".join(lines)
 
@@ -447,7 +547,7 @@ def main():
     parser.add_argument("--max-storage-per-node-gb", type=float, default=None, help=f"Max disk per node in GB (default: {DEFAULTS['max_storage_per_node_gb']} = 20 TB)")
 
     # Optional overrides for fixed parameters
-    parser.add_argument("--rpc-overhead",        type=float, help=f"RPC overhead multiplier (default: {DEFAULTS['rpc_overhead']})")
+    parser.add_argument("--rpc-overhead",        type=float, help=f"RPC overhead fraction added to base 1.0 (default: {DEFAULTS['rpc_overhead']} → multiplier 1.20)")
     parser.add_argument("--index-overhead",      type=float, help=f"Index overhead fraction (default: {DEFAULTS['index_overhead']})")
     parser.add_argument("--compression-ratio",   type=float, help=f"Compression reduction fraction (default: {DEFAULTS['compression_ratio']})")
     parser.add_argument("--wal-overhead",        type=float, help=f"WAL overhead fraction (default: {DEFAULTS['wal_overhead']})")
@@ -458,6 +558,12 @@ def main():
     parser.add_argument("--conn-cpu-overhead",   type=float, help=f"CPU core overhead per connection (default: {DEFAULTS['conn_cpu_overhead']})")
     parser.add_argument("--write-amp-factor",    type=float, help=f"LSM write amplification factor (default: {DEFAULTS['write_amp_factor']})")
     parser.add_argument("--read-cache-miss",     type=float, help=f"Read cache miss fraction (default: {DEFAULTS['read_cache_miss']})")
+
+    # CDC / xCluster feature flags
+    parser.add_argument("--cdc",                 action="store_true", default=False, help="Enable CDC (Change Data Capture): adds 5%% CPU overhead by default")
+    parser.add_argument("--cdc-overhead",        type=float, default=None,           help=f"Override CDC CPU overhead fraction (default: {DEFAULTS['cdc_overhead']})")
+    parser.add_argument("--xcluster",            action="store_true", default=False, help="Enable xCluster replication: adds 5%% CPU overhead by default")
+    parser.add_argument("--xcluster-overhead",   type=float, default=None,           help=f"Override xCluster CPU overhead fraction (default: {DEFAULTS['xcluster_overhead']})")
 
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted report")
 
@@ -489,6 +595,10 @@ def main():
         conn_cpu_overhead=args.conn_cpu_overhead,
         write_amp_factor=args.write_amp_factor,
         read_cache_miss=args.read_cache_miss,
+        cdc_enabled=args.cdc,
+        cdc_overhead=args.cdc_overhead,
+        xcluster_enabled=args.xcluster,
+        xcluster_overhead=args.xcluster_overhead,
     )
 
     if args.json:
