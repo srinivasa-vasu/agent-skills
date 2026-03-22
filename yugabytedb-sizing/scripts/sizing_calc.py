@@ -30,9 +30,9 @@ DEFAULTS = {
     "index_overhead":      0.20,   # 20% extra storage for indexes
     "compression_ratio":   0.30,   # 30% compression reduction
     "wal_overhead":        0.10,   # 10% WAL storage overhead
-    "compaction_reserve":  0.35,   # 35% free space for LSM compaction
+    "compaction_reserve":  0.25,   # 25% free space for LSM compaction
     "target_cpu_util":     0.65,   # 65% max sustained CPU utilization
-    "conn_per_vcpu":       32,     # YugabyteDB connections per vCPU
+    "conn_per_vcpu":       16,     # YugabyteDB connections per vCPU
     "mem_mb_per_conn":     60,     # MB of RAM per connection
     "conn_cpu_overhead":   0.002,  # CPU cores consumed per connection (~0.2%)
     "write_amp_factor":    4,      # LSM write amplification factor for IOPS estimate
@@ -455,7 +455,7 @@ def format_report(r):
         "PER-NODE OPERATIONAL LIMITS",
         "─" * 44,
         f"  DB Operations / node / s:    {c['db_ops_per_node_per_s']:,}",
-        f"  PG Connections / node:       {c['conn_per_node']}  (32 × {i['vcpu_per_node']} vCPU)",
+        f"  PG Connections / node:       {c['conn_per_node']}  (16 × {i['vcpu_per_node']} vCPU)",
         f"  Connection CPU / node:       {c['conn_cpu_per_node']} cores",
         f"  CPU Utilization:             {c['cpu_utilization_pct']}%  ✅  (target ≤65%)",
         f"  Est. IOPS / node:            {int(io['total_iops_per_node']):,}",

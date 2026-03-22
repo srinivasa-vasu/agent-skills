@@ -11,7 +11,7 @@ Choosing the right cluster size for YugabyteDB requires balancing CPU, memory, s
 | Area | What's Computed |
 |---|---|
 | **CPU Sizing** | Effective ops/s with RF and RPC overhead, iterative node count with connection CPU overhead, target ≤65% utilization |
-| **Storage** | LZ4 compression, RF replication, 20% index overhead, 10% WAL, 35% compaction reserve, 20 TB/node cap |
+| **Storage** | LZ4 compression, RF replication, 20% index overhead, 10% WAL, 25% compaction reserve, 20 TB/node cap |
 | **Memory** | 1:4 (write-heavy) or 1:8 (read-heavy) vCPU:RAM ratio + 60 MB per PG connection, rounded to standard RAM tiers |
 | **IOPS** | Write IOPS with ×4 LSM write amplification, read IOPS with 30% cache miss rate |
 | **Network** | Inter-node Raft write traffic + read throughput per node (keep below 40% NIC capacity) |
