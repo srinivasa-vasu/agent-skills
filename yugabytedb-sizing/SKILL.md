@@ -40,7 +40,7 @@ This skill performs accurate YugabyteDB cluster sizing from workload inputs, pro
 | Index Storage Overhead | 20% | Additional storage for indexes |
 | Compression ratio | 30% reduction | YugabyteDB LZ4 compression applied to storage |
 | WAL Overhead | 10% | Write-Ahead Log storage on top of compressed+replicated data |
-| Compaction Free Space | 25% | Reserved headroom for LSM-tree compaction operations |
+| Compaction Free Space | 20% | Reserved headroom for LSM-tree compaction operations |
 | Connection CPU overhead | ~0.2% CPU/connection | Background CPU per connection (auth, keepalive, memory mgmt) |
 | Target CPU utilization | 65% | Maximum sustained CPU utilization (before connection overhead) |
 | Memory ratio | 1:4 or 1:8 vCPU:RAM | Use 1:4 for write-heavy; 1:8 for read/cache-heavy |
@@ -134,7 +134,7 @@ python3 scripts/sizing_calc.py ... --rpc-overhead 0.25
 python3 scripts/sizing_calc.py ... --json
 ```
 
-All fixed defaults (RPC overhead 1.2×, index 20%, compression 30%, WAL 10%, compaction 25%,
+All fixed defaults (RPC overhead 1.2×, index 20%, compression 30%, WAL 10%, compaction 20%,
 16 conn/vCPU, 60 MB/conn) are baked in and match the parameters table below. Override any fixed parameter if needed based on user inputs.
 
 ---
@@ -165,14 +165,14 @@ Reads go to the leader by default (RF not multiplied unless using follower reads
 
 ### Step 3: Calculate CPU Cores Required
 Each active PostgreSQL connection consumes background CPU for authentication, memory management,
-and idle keepalive work — approximately 0.5–1% of a CPU core per connection under load.
+and idle keepalive work — approximately 0.2% of a CPU core per connection (default `conn_cpu_overhead`).
 
 ```
 CPU seconds/s needed    = Total Effective Ops/s × (Avg Execution Time ms / 1000)
 Raw vCPUs (workload)    = CPU seconds/s needed
 
 PG connections/node     = 16 × vCPU/node   (fixed: 16 connections per vCPU)
-Connection CPU overhead = PG connections/node × 0.008  (≈0.8% CPU core per connection)
+Connection CPU overhead = PG connections/node × 0.002  (≈0.2% CPU core per connection)
 
 Total Raw vCPUs needed  = Raw vCPUs (workload) + (Connection CPU overhead × Total nodes)
                           [iterate: re-check after Step 4 since node count affects this]
@@ -195,8 +195,8 @@ Minimum nodes = RF (never go below replication factor).
 ```
 vCPU/node             = chosen vCPU tier (e.g., 8, 16, 32)
 Total vCPU            = Total nodes × vCPU/node
-PG connections/node   = 32 × vCPU/node
-Connection CPU/node   = PG connections/node × 0.008  (CPU cores consumed by connections)
+PG connections/node   = 16 × vCPU/node
+Connection CPU/node   = PG connections/node × 0.002  (CPU cores consumed by connections)
 Total connection CPU  = Connection CPU/node × Total nodes
 
 Effective vCPUs used  = Adjusted vCPUs (workload) + Total connection CPU
@@ -215,20 +215,20 @@ With Replication (GB)    = After Compression × RF
 Base Storage/node (GB)   = With Replication / Total nodes
 
 WAL overhead             = Base Storage/node × 0.10   (10% for Write-Ahead Log)
-Compaction reserve       = Base Storage/node × 0.35   (35% free space for LSM compaction)
+Compaction reserve       = Base Storage/node × 0.20   (20% free space for LSM compaction)
 
 Recommended Storage/node = Base Storage/node + WAL overhead + Compaction reserve
-                         = Base Storage/node × (1 + 0.10 + 0.35)
-                         = Base Storage/node × 1.45
+                         = Base Storage/node × (1 + 0.10 + 0.20)
+                         = Base Storage/node × 1.30
 
 If Storage/node > 20,480 GB (20 TB cap):
     Add nodes in RF multiples until Storage/node ≤ 20,480 GB
     Flag in output how many nodes were added due to storage cap
 ```
-> **Why 35% compaction reserve?** YugabyteDB's DocDB uses an LSM-tree (like RocksDB). Compaction
+> **Why 20% compaction reserve?** YugabyteDB's DocDB uses an LSM-tree (like RocksDB). Compaction
 > merges SSTables in the background and requires temporary space for both old and new files to
 > coexist. Without adequate free space, compaction stalls and write amplification spikes.
-> A minimum of 30–40% free space is required for healthy compaction; 35% is the recommended default.
+> A minimum of 15–25% free space is required for healthy compaction; 20% is the recommended default.
 
 ### Step 7: Memory Recommendation
 Each PostgreSQL connection reserves 60 MB of RAM for its session state (working memory, sort
@@ -236,14 +236,14 @@ buffers, stack). This is additive on top of the shared block cache.
 
 ```
 Connection memory/node  = PG connections/node × 60 MB
-                        = (32 × vCPU/node) × 60 MB
-                        = 1,920 MB per vCPU  →  ≈ 1.875 GB per vCPU
+                        = (16 × vCPU/node) × 60 MB
+                        = 960 MB per vCPU  →  ≈ 0.94 GB per vCPU
 
 If Write% ≥ 50%:  Base memory/node = vCPU/node × 4 GB   (write-heavy, smaller read cache)
 If Write% < 50%:  Base memory/node = vCPU/node × 8 GB   (read-heavy, large block cache)
 
 Recommended memory/node = Base memory/node + Connection memory/node
-                        = Base memory/node + (32 × vCPU/node × 0.06 GB)
+                        = Base memory/node + (16 × vCPU/node × 0.06 GB)
                           [round up to standard RAM tier: 32, 64, 128, 256 GB]
 
 Total Memory = Recommended memory/node × Total nodes
@@ -376,7 +376,7 @@ FAILURE RESILIENCE  (zone layout: RF={RF} zones × {N} nodes/zone)
 
 NOTES
 ─────
-  • Storage: LZ4 compression (30%) + 20% index overhead + 10% WAL + 25% compaction reserve (×1.35 total)
+  • Storage: LZ4 compression (30%) + 20% index overhead + 10% WAL + 20% compaction reserve (×1.30 total)
   • CPU: Includes ~0.2% core overhead per PG connection (16 connections/vCPU)
   • Memory: Base ratio (1:4 or 1:8) + 60 MB × connections, rounded to standard RAM tier
   • Scale horizontally by adding nodes in multiples of RF
@@ -427,48 +427,38 @@ Total Eff.  = 19,200 ops/s
 CPU s/s (workload) = 19,200 × 0.005 = 96 CPU-seconds/s
 
 Connections/node (16 vCPU) = 16 × 16 = 256
-Connection CPU/node        = 256 × 0.008 = 2.0 cores
+Connection CPU/node        = 256 × 0.002 = 0.512 cores
 
 First-pass (ignore connection overhead):
-  vCPUs needed = 96 / 0.65 ≈ 148 → 12 nodes × 16 vCPU = 192 total vCPU (multiple of RF=3)
+  Adjusted vCPUs = 96 / 0.65 ≈ 148 → ceil(148/16) = 10 → 12 nodes (rounded up to RF=3 multiple)
 
-Add connection overhead (12 nodes):
-  Total connection CPU = 2.0 × 12 = 24.0 cores
-  Effective vCPUs used = 148 + 24.0 = 172.0
-  CPU util = 172.0 / 192 = 90% ❌ → increase to 15 nodes
+Verify with connection overhead (12 nodes):
+  Total connection CPU = 0.512 × 12 = 6.1 cores
+  Effective vCPUs used = 96 + 6.1 = 102.1
+  CPU util = 102.1 / 192 = 53.2% ✅
 
-  15 nodes × 16 vCPU = 240 total vCPU
-  Total connection CPU = 2.0 × 15 = 30.0
-  Effective vCPUs = 148 + 30.0 = 178.0
-  CPU util = 178.0 / 240 = 74% ❌ → increase to 18 nodes
+→ Recommendation: 12 nodes, 16 vCPU/node
 
-  18 nodes × 16 vCPU = 288 total vCPU
-  Total connection CPU = 2.0 × 18 = 36.0
-  Effective vCPUs = 148 + 36.0 = 184.0
-  CPU util = 184.0 / 288 = 64% ✅
-
-→ Recommendation: 18 nodes, 16 vCPU/node
-
-Storage (18 nodes):
+Storage (12 nodes):
   Index = 500 × 0.20 = 100 GB → Total Raw = 600 GB
   Compressed = 600 × 0.70 = 420 GB
   With RF3 = 420 × 3 = 1,260 GB
-  Base/node = 1,260 / 18 = 70.0 GB
-  Storage/node = 70.0 × 1.35 = 94.5 GB → round to 100 GB provisioned
-  Total Storage = 100 × 18 = 1,800 GB
+  Base/node = 1,260 / 12 = 105.0 GB
+  Storage/node = 105.0 × 1.30 = 136.5 GB
+  Total Storage = 136.5 × 12 = 1,638 GB
 
 Memory (read-heavy 70%, 16 vCPU, 256 connections/node):
   Base = 16 × 8 = 128 GB
   Connection memory = 256 × 0.06 GB = 15.4 GB
-  Total/node = 128 + 15.4 = 143.4 GB → use 160 GB tier
+  Total/node = 128 + 15.4 = 143.4 GB → use 192 GB tier
 
 PG Connections/node: 16 × 16 = 256
-DB Ops/node: 19,200 / 18 = 1,067 ops/s/node
-Total Memory: 160 × 18 = 2,880 GB
+DB Ops/node: 19,200 / 12 = 1,600 ops/s/node
+Total Memory: 192 × 12 = 2,304 GB
 
-Failure Resilience (RF=3 zones, 18 nodes → 6 nodes/zone):
-  Normal (18 nodes):        64%  ✅
-  1-node failure (17 nodes): effective_vcpus / (17 × 16) → ~67%  ⚠️ EXCEEDS TARGET
-  1-zone failure (12 nodes): effective_vcpus / (12 × 16) → ~96%  ⚠️ EXCEEDS TARGET
+Failure Resilience (RF=3 zones, 12 nodes → 4 nodes/zone):
+  Normal (12 nodes):         53.2%  ✅
+  1-node failure (11 nodes): (96 + 0.512×11) / (11×16) = 101.6 / 176 = 57.7%  ✅ within target
+  1-zone failure (8 nodes):  (96 + 0.512×8)  / (8×16)  = 100.1 / 128 = 78.2%  ⚠️ EXCEEDS TARGET
   → Recommend adding 3 more nodes (RF multiple) to provide comfortable failure headroom.
 ```

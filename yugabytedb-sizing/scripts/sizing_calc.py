@@ -30,7 +30,7 @@ DEFAULTS = {
     "index_overhead":      0.20,   # 20% extra storage for indexes
     "compression_ratio":   0.30,   # 30% compression reduction
     "wal_overhead":        0.10,   # 10% WAL storage overhead
-    "compaction_reserve":  0.25,   # 25% free space for LSM compaction
+    "compaction_reserve":  0.20,   # 20% free space for LSM compaction
     "target_cpu_util":     0.65,   # 65% max sustained CPU utilization
     "conn_per_vcpu":       16,     # YugabyteDB connections per vCPU
     "mem_mb_per_conn":     60,     # MB of RAM per connection
@@ -100,20 +100,20 @@ def calculate(
     xcluster_overhead=None,
 ):
     # Apply defaults for any unset overrides
-    rpc_overhead       = rpc_overhead       or DEFAULTS["rpc_overhead"]
-    index_overhead     = index_overhead     or DEFAULTS["index_overhead"]
-    compression_ratio  = compression_ratio  or DEFAULTS["compression_ratio"]
-    wal_overhead       = wal_overhead       or DEFAULTS["wal_overhead"]
-    compaction_reserve = compaction_reserve or DEFAULTS["compaction_reserve"]
-    target_cpu_util    = target_cpu_util    or DEFAULTS["target_cpu_util"]
-    conn_per_vcpu      = conn_per_vcpu      or DEFAULTS["conn_per_vcpu"]
-    mem_mb_per_conn    = mem_mb_per_conn    or DEFAULTS["mem_mb_per_conn"]
-    conn_cpu_overhead  = conn_cpu_overhead  or DEFAULTS["conn_cpu_overhead"]
-    write_amp_factor   = write_amp_factor   or DEFAULTS["write_amp_factor"]
-    read_cache_miss    = read_cache_miss    or DEFAULTS["read_cache_miss"]
-    avg_row_bytes      = avg_row_bytes      or DEFAULTS["avg_row_bytes"]
-    growth_rate_pct    = growth_rate_pct    if growth_rate_pct is not None else DEFAULTS["growth_rate_pct"]
-    max_storage_per_node_gb = max_storage_per_node_gb or DEFAULTS["max_storage_per_node_gb"]
+    rpc_overhead       = rpc_overhead       if rpc_overhead       is not None else DEFAULTS["rpc_overhead"]
+    index_overhead     = index_overhead     if index_overhead     is not None else DEFAULTS["index_overhead"]
+    compression_ratio  = compression_ratio  if compression_ratio  is not None else DEFAULTS["compression_ratio"]
+    wal_overhead       = wal_overhead       if wal_overhead       is not None else DEFAULTS["wal_overhead"]
+    compaction_reserve = compaction_reserve if compaction_reserve is not None else DEFAULTS["compaction_reserve"]
+    target_cpu_util    = target_cpu_util    if target_cpu_util    is not None else DEFAULTS["target_cpu_util"]
+    conn_per_vcpu      = conn_per_vcpu      if conn_per_vcpu      is not None else DEFAULTS["conn_per_vcpu"]
+    mem_mb_per_conn    = mem_mb_per_conn    if mem_mb_per_conn    is not None else DEFAULTS["mem_mb_per_conn"]
+    conn_cpu_overhead  = conn_cpu_overhead  if conn_cpu_overhead  is not None else DEFAULTS["conn_cpu_overhead"]
+    write_amp_factor   = write_amp_factor   if write_amp_factor   is not None else DEFAULTS["write_amp_factor"]
+    read_cache_miss    = read_cache_miss    if read_cache_miss    is not None else DEFAULTS["read_cache_miss"]
+    avg_row_bytes      = avg_row_bytes      if avg_row_bytes      is not None else DEFAULTS["avg_row_bytes"]
+    growth_rate_pct    = growth_rate_pct    if growth_rate_pct    is not None else DEFAULTS["growth_rate_pct"]
+    max_storage_per_node_gb = max_storage_per_node_gb if max_storage_per_node_gb is not None else DEFAULTS["max_storage_per_node_gb"]
     cdc_overhead       = cdc_overhead       if cdc_overhead       is not None else DEFAULTS["cdc_overhead"]
     xcluster_overhead  = xcluster_overhead  if xcluster_overhead  is not None else DEFAULTS["xcluster_overhead"]
 
@@ -317,7 +317,7 @@ def calculate(
             "eff_read_ops_per_s": round(eff_read_ops, 1),
             "total_eff_ops_per_s": round(total_eff_ops, 1),
             "cpu_seconds_needed": round(cpu_seconds_needed, 2),
-            "raw_vcpus_workload_only": round(raw_vcpus_workload, 1),
+            "raw_vcpus_workload_incl_features": round(raw_vcpus_workload, 1),
         },
         "sizing_iterations": iterations,
         "cluster": {
@@ -357,13 +357,13 @@ def calculate(
             "write_iops_per_node": round(write_iops_per_node, 0),
             "read_iops_per_node": round(read_iops_per_node, 0),
             "total_iops_per_node": round(total_iops_per_node, 0),
-            "note": "Write IOPS include LSM write amplification ×4. Read IOPS assume 30% cache miss.",
+            "note": f"Write IOPS include LSM write amplification ×{write_amp_factor}. Read IOPS assume {read_cache_miss*100:.0f}% cache miss.",
         },
         "network": {
             "write_net_mbps_per_node": round(write_net_mbps, 2),
             "read_net_mbps_per_node": round(read_net_mbps, 2),
             "total_net_mbps_per_node": round(total_net_mbps, 2),
-            "note": "Keep below 40% of NIC capacity (e.g. 4,000 MB/s on 10 GbE).",
+            "note": "Keep below 40% of NIC capacity (e.g. 500 MB/s on 10 GbE, 2,500 MB/s on 50 GbE).",
         },
         "failure_scenarios": failure_scenarios,
     }
@@ -422,7 +422,7 @@ def format_report(r):
         f"  Effective Write Ops/s:       {w['eff_write_ops_per_s']:,}  (×RF×{r['parameters']['rpc_multiplier']} RPC overhead)",
         f"  Effective Read Ops/s:        {w['eff_read_ops_per_s']:,}  (×{r['parameters']['rpc_multiplier']} RPC overhead)",
         f"  Total Effective Ops/s:       {w['total_eff_ops_per_s']:,}",
-        f"  vCPUs needed (workload):     {w['raw_vcpus_workload_only']}",
+        f"  vCPUs needed (workload):     {w['raw_vcpus_workload_incl_features']}",
         "",
         "NODE SIZING ITERATIONS",
         "─" * 44,
@@ -455,12 +455,12 @@ def format_report(r):
         "PER-NODE OPERATIONAL LIMITS",
         "─" * 44,
         f"  DB Operations / node / s:    {c['db_ops_per_node_per_s']:,}",
-        f"  PG Connections / node:       {c['conn_per_node']}  (16 × {i['vcpu_per_node']} vCPU)",
+        f"  PG Connections / node:       {c['conn_per_node']}  ({r['parameters']['conn_per_vcpu']} × {i['vcpu_per_node']} vCPU)",
         f"  Connection CPU / node:       {c['conn_cpu_per_node']} cores",
-        f"  CPU Utilization:             {c['cpu_utilization_pct']}%  ✅  (target ≤65%)",
+        f"  CPU Utilization:             {c['cpu_utilization_pct']}%  ✅  (target ≤{r['parameters']['target_cpu_util_pct']:.0f}%)",
         f"  Est. IOPS / node:            {int(io['total_iops_per_node']):,}",
         f"    → Write IOPS:              {int(io['write_iops_per_node']):,}  (incl. ×{r['parameters']['write_amp_factor']} write amp)",
-        f"    → Read IOPS (cold):        {int(io['read_iops_per_node']):,}  (30% cache miss assumed)",
+        f"    → Read IOPS (cold):        {int(io['read_iops_per_node']):,}  ({r['parameters']['read_cache_miss_pct']:.0f}% cache miss assumed)",
         f"  Est. Network / node:         {nw['total_net_mbps_per_node']:.1f} MB/s",
         f"    → Write (Raft):            {nw['write_net_mbps_per_node']:.1f} MB/s",
         f"    → Read:                    {nw['read_net_mbps_per_node']:.1f} MB/s",
@@ -476,7 +476,7 @@ def format_report(r):
         "MEMORY BREAKDOWN",
         "─" * 44,
         f"  Base ratio:                  {m['base_mem_ratio']} vCPU:RAM = {m['base_mem_gb']} GB",
-        f"  Connection memory:           {c['conn_per_node']} conns × 60 MB = {m['conn_mem_gb']} GB",
+        f"  Connection memory:           {c['conn_per_node']} conns × {r['parameters']['mem_mb_per_conn']:.0f} MB = {m['conn_mem_gb']} GB",
         f"  Raw total / node:            {m['raw_mem_per_node_gb']} GB",
         f"  Recommended / node:          {m['mem_per_node_gb']} GB  (standard tier)",
         "",
@@ -520,7 +520,7 @@ def format_report(r):
     ]
 
     if nf["exceeds_target"] or zf["exceeds_target"]:
-        lines.append("  💡 Consider adding nodes (in multiples of RF) to stay within 65% under failure.")
+        lines.append(f"  💡 Consider adding nodes (in multiples of RF) to stay within {r['parameters']['target_cpu_util_pct']:.0f}% under failure.")
         lines.append("")
 
     lines.append("═" * 56)

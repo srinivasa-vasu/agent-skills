@@ -11,7 +11,7 @@ Choosing the right cluster size for YugabyteDB requires balancing CPU, memory, s
 | Area | What's Computed |
 |---|---|
 | **CPU Sizing** | Effective ops/s with RF and RPC overhead, iterative node count with connection CPU overhead, target ≤65% utilization |
-| **Storage** | LZ4 compression, RF replication, 20% index overhead, 10% WAL, 25% compaction reserve, 20 TB/node cap |
+| **Storage** | LZ4 compression, RF replication, 20% index overhead, 10% WAL, 20% compaction reserve, 20 TB/node cap |
 | **Memory** | 1:4 (write-heavy) or 1:8 (read-heavy) vCPU:RAM ratio + 60 MB per PG connection, rounded to standard RAM tiers |
 | **IOPS** | Write IOPS with ×4 LSM write amplification, read IOPS with 30% cache miss rate |
 | **Network** | Inter-node Raft write traffic + read throughput per node (keep below 40% NIC capacity) |
@@ -55,7 +55,7 @@ This skill activates when a user:
 
 **Tuned connection density** — reduce connections per vCPU for latency-sensitive workloads:
 
-> *"I need a YugabyteDB cluster for 12,000 QPS (90% reads), 500 GB, RF 3, 32 vCPU nodes. Use 16 connections per vCPU instead of the default 32."*
+> *"I need a YugabyteDB cluster for 12,000 QPS (90% reads), 500 GB, RF 3, 32 vCPU nodes. Use 8 connections per vCPU instead of the default 16."*
 
 **Custom compression and compaction** — adjust storage assumptions for a known workload:
 
@@ -83,9 +83,9 @@ This skill activates when a user:
 |---|---|---|
 | RPC overhead | 20% | Joins, index lookups, retry overhead, auto-analyze |
 | Compression | 30% reduction | LZ4 compression |
-| Compaction reserve | 35% | LSM-tree compaction free space |
+| Compaction reserve | 20% | LSM-tree compaction free space |
 | Target CPU utilization | 65% | Max sustained utilization |
-| Connections/vCPU | 32 | PostgreSQL connections per vCPU |
+| Connections/vCPU | 16 | PostgreSQL connections per vCPU |
 | Memory/connection | 60 MB | RAM reserved per connection |
 | Max storage/node | 20 TB | Hard cap; extra nodes added if exceeded |
 
