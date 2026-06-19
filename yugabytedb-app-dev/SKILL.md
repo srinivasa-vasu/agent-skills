@@ -37,7 +37,7 @@ requires attention to three areas standard Postgres apps often skip:
 | Java / Spring Boot Reactive | `r2dbc-postgresql` + r2dbc-pool | Reactor `.retryWhen(YbRetry.spec())` inline in pipeline |
 | Java / Quarkus | `jdbc-yugabytedb` + Agroal | SmallRye `@Retry` + CDI interceptor for exception translation |
 | Python | `psycopg2` / `asyncpg` | Custom decorator wrapping `psycopg2.errors.SerializationFailure` | Two connection pools |
-| Node.js | `pg` (node-postgres) | Async retry loop catching `40001`/`40P01` | Two `Pool` instances |
+| Node.js | `@yugabytedb/pg` (smart driver) | `withRetry` loop catching `40001`/`40P01`/`XX000` | `EndpointPoolManager` (multi-endpoint probe + failover) |
 | Go | `pgx` | `pgx` retry loop | Two `pgxpool.Pool` instances |
 | .NET / ASP.NET Core | `Npgsql` + EF Core | Polly `AsyncRetryPolicy` | Two `DbContext` registrations (rw + ro) |
 
@@ -162,7 +162,7 @@ pip install psycopg2-binary  # or asyncpg for async
 
 **Node.js:**
 ```bash
-npm install pg
+npm install @yugabytedb/pg    # YugabyteDB smart driver (fork of node-postgres)
 ```
 
 **Go:**
