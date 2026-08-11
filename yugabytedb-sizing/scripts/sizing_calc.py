@@ -42,6 +42,9 @@ DEFAULTS = {
     "max_storage_per_node_gb": 20480,  # 20 TB max disk density per node
     "cdc_overhead":         0.05,   # 5% extra CPU overhead when CDC is enabled
     "xcluster_overhead":    0.05,   # 5% extra CPU overhead when xCluster is enabled
+    "tablets_per_table":       1,      # 1 tablet per table/index (no pre-splitting) unless overridden
+    "tablet_vcpu_per_1000":    0.4,    # vCPU consumed per 1,000 tablets (cluster-wide) for tablet maintenance
+    "tablet_mem_mb_per_1000":  700,    # MB of RAM consumed per 1,000 tablets (cluster-wide) for tablet maintenance
 }
 
 # Estimated avg execution time (ms) by workload profile when not provided by user
@@ -98,6 +101,10 @@ def calculate(
     cdc_overhead=None,
     xcluster_enabled=False,
     xcluster_overhead=None,
+    num_objects=None,           # tables + indexes count (optional)
+    tablets_per_table=None,
+    tablet_vcpu_per_1000=None,
+    tablet_mem_mb_per_1000=None,
 ):
     # Apply defaults for any unset overrides
     rpc_overhead       = rpc_overhead       if rpc_overhead       is not None else DEFAULTS["rpc_overhead"]
@@ -116,6 +123,9 @@ def calculate(
     max_storage_per_node_gb = max_storage_per_node_gb if max_storage_per_node_gb is not None else DEFAULTS["max_storage_per_node_gb"]
     cdc_overhead       = cdc_overhead       if cdc_overhead       is not None else DEFAULTS["cdc_overhead"]
     xcluster_overhead  = xcluster_overhead  if xcluster_overhead  is not None else DEFAULTS["xcluster_overhead"]
+    tablets_per_table       = tablets_per_table       if tablets_per_table       is not None else DEFAULTS["tablets_per_table"]
+    tablet_vcpu_per_1000    = tablet_vcpu_per_1000    if tablet_vcpu_per_1000    is not None else DEFAULTS["tablet_vcpu_per_1000"]
+    tablet_mem_mb_per_1000  = tablet_mem_mb_per_1000  if tablet_mem_mb_per_1000  is not None else DEFAULTS["tablet_mem_mb_per_1000"]
 
     # ── Exec time: estimate if not provided ────────────────────────────────
     exec_time_estimated = avg_exec_ms is None
@@ -149,11 +159,26 @@ def calculate(
         feature_overhead_factor += xcluster_overhead
     cpu_seconds_needed = cpu_seconds_needed * feature_overhead_factor
 
+    # ── Tablet maintenance overhead (optional, driven by num_objects) ──────
+    # Each table/index starts as 1 tablet (no pre-splitting); RF replicas of each
+    # tablet exist cluster-wide. Every 1,000 tablets costs a fixed cluster-wide
+    # amount of vCPU + RAM for background tablet maintenance (Raft heartbeats,
+    # bootstrapping, etc.) — independent of workload ops/s.
+    tablets_enabled = num_objects is not None
+    if tablets_enabled:
+        total_tablets          = num_objects * tablets_per_table * rf
+        tablet_vcpu_overhead   = (total_tablets / 1000) * tablet_vcpu_per_1000
+        tablet_mem_overhead_mb = (total_tablets / 1000) * tablet_mem_mb_per_1000
+    else:
+        total_tablets          = 0
+        tablet_vcpu_overhead   = 0.0
+        tablet_mem_overhead_mb = 0.0
+
     # ── Step 4 + 5: Iterative node sizing with connection overhead ─────────
     conn_per_node     = conn_per_vcpu * vcpu_per_node
     conn_cpu_per_node = conn_per_node * conn_cpu_overhead
 
-    raw_vcpus_workload = cpu_seconds_needed
+    raw_vcpus_workload = cpu_seconds_needed + tablet_vcpu_overhead
     adj_vcpus_first    = raw_vcpus_workload / target_cpu_util
     nodes_first        = round_up_to_rf_multiple(
                              math.ceil(adj_vcpus_first / vcpu_per_node), rf
@@ -217,12 +242,13 @@ def calculate(
     total_storage = storage_per_node * total_nodes
 
     # ── Step 7: Memory ─────────────────────────────────────────────────────
-    base_mem_ratio    = 4 if write_pct >= 50 else 8
-    base_mem_gb       = vcpu_per_node * base_mem_ratio
-    conn_mem_gb       = conn_per_node * mem_mb_per_conn / 1024
-    raw_mem_per_node  = base_mem_gb + conn_mem_gb
-    mem_per_node      = round_up_to_ram_tier(raw_mem_per_node)
-    total_memory      = mem_per_node * total_nodes
+    base_mem_ratio      = 4 if write_pct >= 50 else 8
+    base_mem_gb         = vcpu_per_node * base_mem_ratio
+    conn_mem_gb         = conn_per_node * mem_mb_per_conn / 1024
+    tablet_mem_per_node_gb = (tablet_mem_overhead_mb / total_nodes / 1024) if tablets_enabled else 0.0
+    raw_mem_per_node    = base_mem_gb + conn_mem_gb + tablet_mem_per_node_gb
+    mem_per_node        = round_up_to_ram_tier(raw_mem_per_node)
+    total_memory        = mem_per_node * total_nodes
 
     # ── Step 8: IOPS estimation ────────────────────────────────────────────
     write_iops_per_node = (eff_write_ops / total_nodes) * write_amp_factor
@@ -275,6 +301,20 @@ def calculate(
         },
     }
 
+    # ── Tablet maintenance overhead summary ────────────────────────────────
+    tablets_info = None
+    if tablets_enabled:
+        tablets_info = {
+            "num_objects": num_objects,
+            "tablets_per_table": tablets_per_table,
+            "total_tablets": total_tablets,
+            "tablet_vcpu_overhead_total": round(tablet_vcpu_overhead, 2),
+            "tablet_vcpu_overhead_per_node": round(tablet_vcpu_overhead / total_nodes, 3),
+            "tablet_mem_overhead_total_mb": round(tablet_mem_overhead_mb, 1),
+            "tablet_mem_overhead_per_node_gb": round(tablet_mem_per_node_gb, 2),
+            "low_tablet_count_warning": total_nodes > total_tablets,
+        }
+
     # ── Assemble result ────────────────────────────────────────────────────
     result = {
         "inputs": {
@@ -293,6 +333,7 @@ def calculate(
             "growth_rate_source": "provided" if growth_rate_pct != DEFAULTS["growth_rate_pct"] else "default",
             "cdc_enabled": cdc_enabled,
             "xcluster_enabled": xcluster_enabled,
+            "num_objects": num_objects,
         },
         "parameters": {
             "rpc_overhead": rpc_overhead,
@@ -317,7 +358,7 @@ def calculate(
             "eff_read_ops_per_s": round(eff_read_ops, 1),
             "total_eff_ops_per_s": round(total_eff_ops, 1),
             "cpu_seconds_needed": round(cpu_seconds_needed, 2),
-            "raw_vcpus_workload_incl_features": round(raw_vcpus_workload, 1),
+            "raw_vcpus_workload_incl_features_and_tablets": round(raw_vcpus_workload, 1),
         },
         "sizing_iterations": iterations,
         "cluster": {
@@ -349,6 +390,7 @@ def calculate(
             "base_mem_ratio": f"1:{base_mem_ratio}",
             "base_mem_gb": round(base_mem_gb, 1),
             "conn_mem_gb": round(conn_mem_gb, 1),
+            "tablet_mem_gb": round(tablet_mem_per_node_gb, 2),
             "raw_mem_per_node_gb": round(raw_mem_per_node, 1),
             "mem_per_node_gb": mem_per_node,
             "total_memory_gb": total_memory,
@@ -366,6 +408,7 @@ def calculate(
             "note": "Keep below 40% of NIC capacity (e.g. 500 MB/s on 10 GbE, 2,500 MB/s on 50 GbE).",
         },
         "failure_scenarios": failure_scenarios,
+        "tablets": tablets_info,
     }
     return result
 
@@ -403,6 +446,12 @@ def format_report(r):
         f"  Data growth rate:            {i['growth_rate_pct']}%/yr  ({i['growth_rate_source']})",
     ]
 
+    t = r.get("tablets")
+    if t:
+        lines.append(
+            f"  Objects (tables+indexes):    {t['num_objects']:,}  → {t['total_tablets']:,} tablets @ RF={i['rf']}"
+        )
+
     feature_lines = []
     if i.get("cdc_enabled"):
         pct = r["parameters"]["cdc_overhead_pct"]
@@ -422,7 +471,7 @@ def format_report(r):
         f"  Effective Write Ops/s:       {w['eff_write_ops_per_s']:,}  (×RF×{r['parameters']['rpc_multiplier']} RPC overhead)",
         f"  Effective Read Ops/s:        {w['eff_read_ops_per_s']:,}  (×{r['parameters']['rpc_multiplier']} RPC overhead)",
         f"  Total Effective Ops/s:       {w['total_eff_ops_per_s']:,}",
-        f"  vCPUs needed (workload):     {w['raw_vcpus_workload_incl_features']}",
+        f"  vCPUs needed (workload+tablets): {w['raw_vcpus_workload_incl_features_and_tablets']}",
         "",
         "NODE SIZING ITERATIONS",
         "─" * 44,
@@ -477,10 +526,31 @@ def format_report(r):
         "─" * 44,
         f"  Base ratio:                  {m['base_mem_ratio']} vCPU:RAM = {m['base_mem_gb']} GB",
         f"  Connection memory:           {c['conn_per_node']} conns × {r['parameters']['mem_mb_per_conn']:.0f} MB = {m['conn_mem_gb']} GB",
+    ]
+    if t:
+        lines.append(f"  Tablet maintenance memory:   {m['tablet_mem_gb']} GB  ({t['total_tablets']:,} tablets / {c['total_nodes']} nodes)")
+    lines += [
         f"  Raw total / node:            {m['raw_mem_per_node_gb']} GB",
         f"  Recommended / node:          {m['mem_per_node_gb']} GB  (standard tier)",
         "",
     ]
+
+    if t:
+        lines += [
+            "TABLET MAINTENANCE OVERHEAD",
+            "─" * 44,
+            f"  Objects (tables+indexes):    {t['num_objects']:,}  ({t['tablets_per_table']} tablet/table × RF={i['rf']})",
+            f"  Total tablets (cluster):     {t['total_tablets']:,}",
+            f"  vCPU overhead (cluster):     {t['tablet_vcpu_overhead_total']}  (≈{t['tablet_vcpu_overhead_per_node']}/node)",
+            f"  RAM overhead (cluster):      {t['tablet_mem_overhead_total_mb']:,.0f} MB  (≈{m['tablet_mem_gb']} GB/node)",
+            "",
+        ]
+        if t.get("low_tablet_count_warning"):
+            lines += [
+                f"⚠️  LOW TABLET COUNT: {c['total_nodes']} nodes but only {t['total_tablets']:,} tablets — "
+                f"some nodes may host no leader tablets for these objects, underusing cluster capacity.",
+                "",
+            ]
 
     if s.get("storage_cap_triggered"):
         lines += [
@@ -565,6 +635,12 @@ def main():
     parser.add_argument("--xcluster",            action="store_true", default=False, help="Enable xCluster replication: adds 5%% CPU overhead by default")
     parser.add_argument("--xcluster-overhead",   type=float, default=None,           help=f"Override xCluster CPU overhead fraction (default: {DEFAULTS['xcluster_overhead']})")
 
+    # Tablet maintenance overhead (optional, driven by schema object count)
+    parser.add_argument("--num-objects",         type=int,   default=None, help="Number of tables + indexes (optional). Adds tablet maintenance CPU/RAM overhead to sizing.")
+    parser.add_argument("--tablets-per-table",   type=int,   default=None, help=f"Tablets per table/index before RF (default: {DEFAULTS['tablets_per_table']} = no pre-split)")
+    parser.add_argument("--tablet-vcpu-per-1000", type=float, default=None, help=f"vCPU overhead per 1,000 tablets, cluster-wide (default: {DEFAULTS['tablet_vcpu_per_1000']})")
+    parser.add_argument("--tablet-mem-mb-per-1000", type=float, default=None, help=f"RAM (MB) overhead per 1,000 tablets, cluster-wide (default: {DEFAULTS['tablet_mem_mb_per_1000']})")
+
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted report")
 
     args = parser.parse_args()
@@ -599,6 +675,10 @@ def main():
         cdc_overhead=args.cdc_overhead,
         xcluster_enabled=args.xcluster,
         xcluster_overhead=args.xcluster_overhead,
+        num_objects=args.num_objects,
+        tablets_per_table=args.tablets_per_table,
+        tablet_vcpu_per_1000=args.tablet_vcpu_per_1000,
+        tablet_mem_mb_per_1000=args.tablet_mem_mb_per_1000,
     )
 
     if args.json:

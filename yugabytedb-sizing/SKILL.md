@@ -32,6 +32,7 @@ This skill performs accurate YugabyteDB cluster sizing from workload inputs, pro
 | Data growth rate (%/yr) | Optional | Used to project storage over 1–2 years; default 30%/yr if unknown |
 | CDC | Optional | Enable Change Data Capture — adds 5% CPU overhead by default (overridable) |
 | xCluster | Optional | Enable cross-cluster replication — adds 5% CPU overhead by default (overridable) |
+| Number of objects (tables + indexes) | Optional | If known, adds tablet-maintenance CPU/RAM overhead to sizing — see below |
 
 ### Fixed / Default Values
 | Parameter | Value | Notes |
@@ -53,6 +54,9 @@ This skill performs accurate YugabyteDB cluster sizing from workload inputs, pro
 | Network overhead factor | 2× write Ops/s | Inter-node Raft traffic ≈ 2× write ops for RF=3 |
 | CDC CPU overhead | 5% | Additional processing overhead when CDC is enabled (overridable via `--cdc-overhead`) |
 | xCluster CPU overhead | 5% | Additional processing overhead when xCluster is enabled (overridable via `--xcluster-overhead`) |
+| Tablets per table/index | 1 | No pre-splitting assumed: 1 table/index = 1 tablet before RF (overridable via `--tablets-per-table`) |
+| Tablet maintenance vCPU | 0.4 per 1,000 tablets | Cluster-wide background CPU (Raft heartbeats, bootstrapping) — overridable via `--tablet-vcpu-per-1000` |
+| Tablet maintenance RAM | 700 MB per 1,000 tablets | Cluster-wide background RAM — overridable via `--tablet-mem-mb-per-1000` |
 
 ### Avg Execution Time — Fallback When Unknown
 
@@ -111,6 +115,16 @@ python3 scripts/sizing_calc.py ... --xcluster
 
 # Both enabled with custom overrides
 python3 scripts/sizing_calc.py ... --cdc --cdc-overhead 0.08 --xcluster --xcluster-overhead 0.06
+```
+
+### With number of objects (tables + indexes) — adds tablet maintenance overhead
+```bash
+# 1,000 objects (tables+indexes) → 3,000 tablets at RF=3 → tablet CPU/RAM overhead included
+python3 scripts/sizing_calc.py ... --num-objects 1000
+
+# Override the per-1,000-tablet overhead constants or the tablets-per-table assumption if needed
+python3 scripts/sizing_calc.py ... --num-objects 1000 --tablets-per-table 2 \
+  --tablet-vcpu-per-1000 0.4 --tablet-mem-mb-per-1000 700
 ```
 
 ### Try multiple vCPU tiers to find the optimal fit
@@ -287,7 +301,42 @@ Storage after 2 yr/node     = storage_per_node × (1 + growth_rate)²
 Present the 2-year projection alongside the current recommendation so the user can provision
 storage volumes that won't require resizing soon after launch.
 
-### Step 11: Failure Resilience — CPU Utilization Under Node/Zone Loss
+### Step 11: Tablet Maintenance Overhead (Optional — requires number of objects)
+
+If the user provides the number of schema objects (tables + indexes), each object starts as a
+single tablet (no pre-splitting), and every tablet is replicated RF times cluster-wide:
+
+```
+Total Tablets = Num Objects × Tablets/Table (default 1) × RF
+```
+
+Example: 1,000 objects × 1 tablet/table × RF=3 = 3,000 tablets cluster-wide.
+
+Tablet maintenance (Raft heartbeats, bootstrapping, background bookkeeping) costs a fixed
+amount of CPU and RAM per 1,000 tablets, **cluster-wide** — independent of QPS/workload:
+
+```
+Tablet vCPU overhead (cluster) = (Total Tablets / 1000) × 0.4 vCPU
+Tablet RAM overhead (cluster)  = (Total Tablets / 1000) × 700 MB
+```
+
+This is added directly to the workload's raw vCPU requirement (Step 3) before the node-sizing
+iteration — it increases node count like any other fixed overhead. The RAM overhead is divided
+evenly across the final node count and added to the per-node memory recommendation (Step 7):
+
+```
+Tablet vCPU overhead/node = Tablet vCPU overhead (cluster) / Total nodes
+Tablet RAM overhead/node  = Tablet RAM overhead (cluster) / Total nodes
+```
+
+> **Why cluster-wide, not per-node?** Tablets are distributed evenly across all nodes regardless
+> of node count, so the total maintenance cost is fixed by tablet count alone; only the *share*
+> each node carries depends on how many nodes split that fixed cost.
+
+⚠️ If the resulting node count exceeds the total tablet count, some nodes may end up hosting no
+leader tablets for these objects — flag this so the user can reconsider tablet count or splitting.
+
+### Step 12: Failure Resilience — CPU Utilization Under Node/Zone Loss
 
 Always compute and report what CPU utilisation looks like if a single node or an entire zone goes down. Zones are aligned to RF: assume one AZ per replica, nodes distributed evenly across zones.
 
@@ -331,6 +380,7 @@ INPUT SUMMARY
   Data growth rate:       {value}%/yr   ({provided | default 30%})
   CDC:                    enabled  (+{N}% CPU overhead)   ← only if enabled
   xCluster:               enabled  (+{N}% CPU overhead)   ← only if enabled
+  Objects (tables+indexes): {value} → {value} tablets @ RF={RF}   ← only if provided
 
 DERIVED WORKLOAD
 ────────────────
@@ -374,10 +424,19 @@ FAILURE RESILIENCE  (zone layout: RF={RF} zones × {N} nodes/zone)
   [If any scenario exceeds 65%]
   💡 Consider adding nodes (in multiples of RF) to stay within 65% under failure.
 
+TABLET MAINTENANCE OVERHEAD  ← only if number of objects provided
+────────────────────────────
+  Objects (tables+indexes):    {value}  ({N} tablet/table × RF={RF})
+  Total tablets (cluster):     {value}
+  vCPU overhead (cluster):     {value}  (≈{value}/node)
+  RAM overhead (cluster):      {value} MB  (≈{value} GB/node)
+  [If nodes > total tablets] ⚠️ LOW TABLET COUNT: some nodes may host no leader tablets.
+
 NOTES
 ─────
   • Storage: LZ4 compression (30%) + 20% index overhead + 10% WAL + 20% compaction reserve (×1.30 total)
   • CPU: Includes ~0.2% core overhead per PG connection (16 connections/vCPU)
+  • CPU/Memory: If object count provided, includes tablet maintenance overhead (0.4 vCPU + 700 MB per 1,000 tablets, cluster-wide)
   • Memory: Base ratio (1:4 or 1:8) + 60 MB × connections, rounded to standard RAM tier
   • Scale horizontally by adding nodes in multiples of RF
   • For Kubernetes: use StatefulSets, one pod per node
@@ -407,7 +466,7 @@ These are approximate — actual throughput depends on operation complexity, row
 - **Minimum cluster**: Always RF nodes (e.g., 3 for RF=3). Never fewer.
 - **Read replicas**: If read% is very high (>80%), consider adding read replicas to offload; they don't count toward the RF quorum.
 - **IOPS**: For NVMe SSDs, plan for ~30 IOPS/GB; for cloud SSDs, check provider limits. Write-heavy workloads benefit from higher IOPS provisioning.
-- **Tablet count**: Default 3 tablets/table. For large tables (>100GB/node), increase tablet count to improve parallelism.
+- **Tablet count**: The tablet-overhead calculation (Step 11) assumes 1 tablet/table (no pre-splitting) as a sizing baseline when the user provides object counts. In practice, for large tables (>100GB/node), YugabyteDB pre-splits into more tablets to improve parallelism — if the user knows their actual/planned tablet count, pass it via `--tablets-per-table` instead of leaving the default.
 - **Growth headroom**: Sizing above assumes peak load. For bursty workloads, add 1–2 extra nodes as buffer or plan for horizontal scaling.
 - **YugabyteDB Managed (cloud)**: Match to available instance types (e.g., AWS r6g.4xlarge = 16 vCPU / 128 GB RAM).
 
