@@ -1,3 +1,6 @@
 .DS_Store
 */.DS_Store
 archive
+.serena
+yugabytedb-issue-finder/
+
