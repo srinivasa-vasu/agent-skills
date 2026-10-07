@@ -51,11 +51,12 @@ Rules:
 | vCPU/node | Required | `--vcpu-per-node` or `--compare 8,16,32` | Cap at 32–64 cores per node |
 | RF | Required | `--rf` | Default 3 |
 | Table size (GB) | Required | `--table-size-gb` | Raw, uncompressed |
-| Workload profile | Recommended | `--workload` | YSQL: `kv` (point ops), `oltp` (transactional, indexed), `complex` (joins/aggregations), `analytics` (scans). YCQL: `point`, `range`, `lwt` (LWT or indexed writes) |
+| Workload profile | Recommended | `--workload` | YSQL: `kv` (point ops), `oltp` (transactional, indexed), `complex` (joins/aggregations), `analytics` (scans), `htap` (OLTP + analytical scans, see below). YCQL: `point`, `range`, `lwt` (LWT or indexed writes) |
 | Observed QPS + CPU% | Recommended | `--observed-qps`, `--observed-cpu-pct` | Calibration from a running cluster — the most accurate basis |
 | Avg latency (ms) | Optional | `--avg-exec-ms` | Not used for CPU; feeds the concurrency check (in-flight vs backends) |
 | Topology | Optional | `--zones`, `--regions`, `--preferred-region`, `--region-rtt-ms` | Multi-AZ (zones = RF) is the default; `--zones 1` for single AZ; `--regions 3` for a synchronous multi-region cluster (one replica per region) |
 | Write pipelining | Optional | `--write-pipelining` | **YSQL only**: `ysql_enable_write_pipelining` (GA in 2026.1.2, off by default) — writes replicate in the background and a transaction pays ~2 round trips at COMMIT instead of one per write. Latency only; CPU unchanged |
+| HTAP analytics | Optional | `--analytics-qps`, `--analytics-rows`, `--analytics-target` | **YSQL only**: analytical queries/s × rows scanned each, served on the `primary` (default), `followers` or a `read-replica` cluster. On with `--workload htap` (defaults 1 q/s × 1M rows, flagged as assumed — ask for real numbers) |
 | Read offload | Optional | `--follower-read-pct`, `--read-replica-read-pct`, `--read-replica-rf` | Share of reads that tolerate bounded staleness, served by followers or a read-replica cluster |
 | Disk limits | Optional | `--disk-iops`, `--disk-mibps` | Default gp3 max (16,000 IOPS, 1,000 MiB/s); nodes are added to fit. Pass NVMe/io2 limits if used |
 | Avg row size | Optional | `--avg-row-bytes` | Default 512; drives WAL, disk and network |
@@ -106,6 +107,10 @@ python3 scripts/sizing_calc.py ... --regions 3 --preferred-region --region-rtt-m
 # Same, with write pipelining (multi-statement transactions across regions)
 python3 scripts/sizing_calc.py ... --regions 3 --preferred-region --write-pipelining
 
+# HTAP: OLTP plus 5 analytical queries/s scanning ~2M rows each, isolated on a read replica
+python3 scripts/sizing_calc.py --qps 20000 --write-pct 30 --read-pct 70 --workload htap \
+  --analytics-qps 5 --analytics-rows 2000000 --analytics-target read-replica ...
+
 # Read-replica cluster for 30% of reads (e.g. remote-region reporting)
 python3 scripts/sizing_calc.py ... --read-replica-read-pct 30 --read-replica-rf 1
 ```
@@ -138,6 +143,10 @@ Lead with the recommendation (nodes × vCPU, RAM and storage per node), then:
   multi-statement write transactions cross regions or the workload is connection-bound.
 - **Transactions and read offload**: distributed-transaction CPU, and the read-replica cluster
   (nodes, RAM, storage) as a separate line item.
+- **HTAP**: scan CPU and scan disk reads, and where analytics run. On the primary, scans compete
+  with OLTP for CPU and evict its cache — recommend isolating them on a read replica (or follower
+  reads if staleness is fine, noting that followers widen each node's cached data). Present the
+  primary and the read-replica cluster as separate line items.
 - **Storage growth**: 1- and 2-year storage per node.
 - **Deployment notes** the script prints (YCQL memory flags, Connection Manager flags).
 - The indicative-sizing disclaimer.

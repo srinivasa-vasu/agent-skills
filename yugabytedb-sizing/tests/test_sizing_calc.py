@@ -65,6 +65,9 @@ SCENARIOS = {
     "ysql_multi_region_preferred": "--qps 20000 --write-pct 30 --read-pct 70 --avg-exec-ms 2 --workload oltp "
                                    "--vcpu-per-node 16 --rf 3 --table-size-gb 500 --regions 3 --preferred-region "
                                    "--size-for zone",
+    "ysql_htap_replica": "--qps 20000 --write-pct 30 --read-pct 70 --workload htap --analytics-qps 5 "
+                         "--analytics-rows 2000000 --analytics-target read-replica --vcpu-per-node 16 --rf 3 "
+                         "--table-size-gb 500",
     "ysql_legacy_wal": "--qps 10000 --write-pct 30 --read-pct 70 --avg-exec-ms 5 --cpu-model latency "
                        "--vcpu-per-node 16 --rf 3 --table-size-gb 500 --wal-overhead 0.10",
 }
@@ -649,6 +652,51 @@ class MultiRegionTests(unittest.TestCase):
             sizing_calc.calculate(**self.BASE, preferred_region=True)
         with self.assertRaises(ValueError):
             sizing_calc.calculate(**self.BASE, regions=3, zones=1)
+
+
+class HtapTests(unittest.TestCase):
+    BASE = dict(qps=20000, write_pct=30, read_pct=70, avg_exec_ms=None, vcpu_per_node=16, rf=3,
+                table_size_gb=500)
+    SCANS = dict(workload="htap", analytics_qps=5, analytics_rows=2_000_000)
+
+    def test_defaults_are_flagged(self):
+        a = sizing_calc.calculate(**self.BASE, workload="htap")["analytics"]
+        self.assertTrue(a["assumed"])
+        self.assertAlmostEqual(a["cores"], 1 * 1_000_000 * 2e-6, places=3)
+
+    def test_scan_cores_and_scaling(self):
+        a = sizing_calc.calculate(**self.BASE, **self.SCANS)["analytics"]
+        self.assertAlmostEqual(a["cores"], 5 * 2_000_000 * 2e-6, places=2)
+        self.assertFalse(a["assumed"])
+        arm = sizing_calc.calculate(**self.BASE, **self.SCANS, cpu_arch="arm")["analytics"]
+        self.assertAlmostEqual(arm["cores"], a["cores"] * 1.10, places=2)
+
+    def test_primary_cpu_includes_scans(self):
+        oltp = sizing_calc.calculate(**self.BASE, workload="oltp")["workload"]["cpu_seconds_needed"]
+        htap = sizing_calc.calculate(**self.BASE, **self.SCANS)["workload"]["cpu_seconds_needed"]
+        self.assertAlmostEqual(htap - oltp, 20.0, places=1)
+
+    def test_read_replica_isolates_analytics(self):
+        oltp = sizing_calc.calculate(**self.BASE, workload="oltp")
+        rr = sizing_calc.calculate(**self.BASE, **self.SCANS, analytics_target="read-replica")
+        self.assertEqual(rr["workload"]["cpu_seconds_needed"], oltp["workload"]["cpu_seconds_needed"])
+        self.assertEqual(rr["read_replica"]["analytics_cores"], 20.0)
+        self.assertGreater(rr["read_replica"]["scan_mibps_per_node"], 0)
+        tight = sizing_calc.calculate(**self.BASE, **self.SCANS, analytics_target="read-replica", disk_mibps=300)
+        self.assertGreater(tight["read_replica"]["disk_nodes_added"], 0)
+        self.assertLessEqual(tight["read_replica"]["disk_mibps_per_node"], 300)
+
+    def test_followers_spread_cpu_but_widen_cache(self):
+        primary = sizing_calc.calculate(**self.BASE, **self.SCANS)
+        followers = sizing_calc.calculate(**self.BASE, **self.SCANS, analytics_target="followers")
+        self.assertEqual(followers["workload"]["cpu_seconds_needed"], primary["workload"]["cpu_seconds_needed"])
+        self.assertGreater(followers["iops"]["scan_mibps_per_node"], primary["iops"]["scan_mibps_per_node"])
+
+    def test_ysql_only(self):
+        with self.assertRaises(ValueError):
+            sizing_calc.calculate(**self.BASE, api="ycql", workload="htap")
+        with self.assertRaises(ValueError):
+            sizing_calc.calculate(**self.BASE, api="ycql", analytics_qps=1)
 
 
 class ValidationTests(unittest.TestCase):

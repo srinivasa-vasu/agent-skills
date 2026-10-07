@@ -50,6 +50,7 @@
   "recommended_vcpu_per_node": 8,
   "results": [
     {
+      "analytics": null,
       "calibration": null,
       "cluster": {
         "client_conn_per_node": 0,
@@ -90,6 +91,7 @@
         }
       },
       "inputs": {
+        "analytics_target": null,
         "api": "ycql",
         "avg_exec_ms": 1.0,
         "avg_row_bytes": 512,
@@ -137,6 +139,7 @@
         "read_cache_miss_pct": 91.7,
         "read_cache_miss_source": "cache vs leader data",
         "read_iops_per_node": 7335.0,
+        "scan_mibps_per_node": 0.0,
         "total_iops_per_node": 11255.0,
         "write_iops_per_node": 3920.0
       },
@@ -263,6 +266,7 @@
       }
     },
     {
+      "analytics": null,
       "calibration": null,
       "cluster": {
         "client_conn_per_node": 0,
@@ -303,6 +307,7 @@
         }
       },
       "inputs": {
+        "analytics_target": null,
         "api": "ycql",
         "avg_exec_ms": 1.0,
         "avg_row_bytes": 512,
@@ -350,6 +355,7 @@
         "read_cache_miss_pct": 83.4,
         "read_cache_miss_source": "cache vs leader data",
         "read_iops_per_node": 6670.0,
+        "scan_mibps_per_node": 0.0,
         "total_iops_per_node": 10590.0,
         "write_iops_per_node": 3920.0
       },
@@ -476,6 +482,7 @@
       }
     },
     {
+      "analytics": null,
       "calibration": null,
       "cluster": {
         "client_conn_per_node": 0,
@@ -516,6 +523,7 @@
         }
       },
       "inputs": {
+        "analytics_target": null,
         "api": "ycql",
         "avg_exec_ms": 1.0,
         "avg_row_bytes": 512,
@@ -563,6 +571,7 @@
         "read_cache_miss_pct": 66.8,
         "read_cache_miss_source": "cache vs leader data",
         "read_iops_per_node": 5340.0,
+        "scan_mibps_per_node": 0.0,
         "total_iops_per_node": 9260.0,
         "write_iops_per_node": 3920.0
       },

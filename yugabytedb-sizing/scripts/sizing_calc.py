@@ -59,6 +59,13 @@ DEFAULTS = {
     "txn_commit_cost":     1.0,
     "txn_intent_cost":     1.0,
     "read_replica_rf":     1,
+    # Analytical (HTAP) scans: CPU per row scanned with filters/aggregates pushed down to DocDB.
+    # A single-stream filtered scan of 38.9M wide rows took ~81 s of storage time (≈2.1 µs/row);
+    # parallel COUNT(*) scans reach 1.5–7.5M rows/s on 3-node clusters.
+    "scan_cpu_us_per_row": 2.0,
+    "htap_default_analytics_qps": 1.0,
+    "htap_default_rows_per_query": 1_000_000,
+    "scan_io_kib":         256,    # gp3 counts each I/O up to 256 KiB as one IOP
     "follower_write_fraction": 0.333,  # follower apply cost relative to the leader's write cost
     "avg_row_bytes":       512,    # Default avg row size if not provided
     "growth_rate_pct":     30,     # Annual data growth rate % if not provided
@@ -137,6 +144,7 @@ WORKLOAD_PROFILES = {
         "oltp":      (1.0, "transactional OLTP, indexed (TPC-C-like) — baseline"),
         "complex":   (2.0, "joins / aggregations"),
         "analytics": (5.0, "scans / reporting queries"),
+        "htap":      (1.0, "transactional OLTP plus analytical scans (--analytics-*)"),
     },
     "ycql": {
         "point":     (1.0, "point reads/writes by full primary key — baseline"),
@@ -153,6 +161,7 @@ WORKLOAD_AUTO = {  # used when --workload is not given; mirrors the exec-time fa
 # on top of these. The other profiles (TPC-C-based oltp and its multiples, YCQL lwt) already include it.
 FASTPATH_PROFILE = {"ysql": "kv", "ycql": "point"}
 FASTPATH_BASED = {"ysql": {"kv"}, "ycql": {"point", "range"}}
+ANALYTICS_TARGETS = ("primary", "followers", "read-replica")
 CPU_ARCH_FACTORS = {"x86": 1.0, "arm": 1.10}   # Graviton (m8g) used 10% more CPU than m8i for the same TPC-C load
 CPU_MODELS = ("per-op", "latency")
 
@@ -290,6 +299,10 @@ class _Sizing:
         preferred_region=False,     # all tablet leaders pinned to one region
         cross_region_cost_per_gb=None,
         write_pipelining=False,     # YSQL ysql_enable_write_pipelining: async Raft per write, wait at COMMIT
+        analytics_qps=None,         # analytical queries/s (HTAP); default with --workload htap
+        analytics_rows=None,        # rows scanned per analytical query
+        analytics_target="primary", # primary | followers | read-replica
+        scan_cpu_us_per_row=None,
     ):
         # ── Validation ─────────────────────────────────────────────────────
         if api not in API_PROFILES:
@@ -333,6 +346,10 @@ class _Sizing:
             zones = rf
         if preferred_region and regions == 1:
             raise ValueError("preferred_region needs a multi-region layout (regions = RF)")
+        if analytics_target not in ANALYTICS_TARGETS:
+            raise ValueError(f"analytics_target must be one of {ANALYTICS_TARGETS}, got {analytics_target!r}")
+        if (workload == "htap" or analytics_qps is not None or analytics_rows is not None) and api != "ysql":
+            raise ValueError("HTAP / analytical scans apply to YSQL only")
         if write_pipelining and api != "ysql":
             raise ValueError("write pipelining (ysql_enable_write_pipelining) applies to YSQL only")
         zones = _pick(zones, rf)
@@ -370,6 +387,13 @@ class _Sizing:
         self.rr_vcpu = _pick(read_replica_vcpu, vcpu_per_node)
         self.regions, self.preferred_region = regions, preferred_region
         self.write_pipelining = write_pipelining
+        # Analytical (HTAP) component: on with --workload htap or any --analytics-* input
+        self.analytics_on = workload == "htap" or analytics_qps is not None or analytics_rows is not None
+        self.analytics_assumed = self.analytics_on and (analytics_qps is None or analytics_rows is None)
+        self.analytics_qps = _pick(analytics_qps, DEFAULTS["htap_default_analytics_qps"]) if self.analytics_on else 0.0
+        self.analytics_rows = _pick(analytics_rows, DEFAULTS["htap_default_rows_per_query"]) if self.analytics_on else 0
+        self.analytics_target = analytics_target
+        self.scan_cpu_us_per_row = _pick(scan_cpu_us_per_row, DEFAULTS["scan_cpu_us_per_row"])
         self.region_rtt_ms = _pick(region_rtt_ms, DEFAULTS["region_rtt_ms"]) if regions > 1 else 0
         self.cross_region_cost_per_gb = _pick(cross_region_cost_per_gb, DEFAULTS["cross_region_cost_per_gb"])
         self.cpu_model, self.workload, self.cpu_arch = cpu_model, workload, cpu_arch
@@ -529,6 +553,14 @@ class _Sizing:
         return {"tps": tps, "write_txns": write_txns, "p_write": p_write, "dist": dist,
                 "applies": applies, "overhead_ms": overhead_ms}
 
+    def _analytics_cores(self):
+        """CPU cores for analytical scans: queries/s × rows × µs/row (pushed-down scans)."""
+        return (self.analytics_qps * self.analytics_rows * self.scan_cpu_us_per_row / 1e6
+                * self.arch_factor * self.cpu_cost_scale)
+
+    def _analytics_on_primary(self):
+        return self.analytics_on and self.analytics_target != "read-replica"
+
     def _region_cores(self, q):
         """(leader-region cores, follower-region cores) per region when leaders are pinned."""
         w, r = q * self.write_pct / 100, q * self.read_pct / 100
@@ -540,6 +572,13 @@ class _Sizing:
         leader = ((r_leader + r_follower_each) * self.cpu_ms_read + write_cost * lead
                   + self._txn(q)["overhead_ms"]) * m / 1000
         follower = (r_follower_each * self.cpu_ms_read + write_cost * (1 - lead) / (self.rf - 1)) * m / 1000
+        if self._analytics_on_primary():
+            scan = self._analytics_cores() * q / self.qps if self.qps else 0
+            if self.analytics_target == "followers":      # spread over every region's replicas
+                leader += scan / self.rf
+                follower += scan / self.rf
+            else:                                         # leader reads in the leader region
+                leader += scan
         return leader, follower
 
     def _model_cores(self, q):
@@ -547,10 +586,14 @@ class _Sizing:
         w, r = q * self.write_pct / 100, q * self.read_pct / 100
         r_primary = r * (1 - self.rr_frac)                         # read replicas take the rest
         if self.cpu_model == "latency":
-            return (w * self.rf + r_primary) * self.rpc_multiplier * self.avg_exec_ms / 1000 * self.feature_overhead_factor
+            scan = self._analytics_cores() * q / self.qps if self._analytics_on_primary() and self.qps else 0
+            return ((w * self.rf + r_primary) * self.rpc_multiplier * self.avg_exec_ms / 1000
+                    * self.feature_overhead_factor + scan)
         balanced = ((r_primary * self.cpu_ms_read + w * self.cpu_ms_write * self.rf_write_scale
                      + self._txn(q)["overhead_ms"]) / 1000
                     * self.workload_multiplier * self.rpc_multiplier * self.feature_overhead_factor * self.arch_factor)
+        if self._analytics_on_primary():
+            balanced += self._analytics_cores() * q / self.qps if self.qps else 0
         if self.preferred_region:
             # Every region is sized to carry the leader load, so it can take over on failover
             return max(balanced, self._region_cores(q)[0] * self.regions)
@@ -703,7 +746,7 @@ class _Sizing:
         # 1:4 by default; read-heavy workloads whose hot data doesn't fit the cache a 1:4 node
         # provides get 1:8 (sysbench: 100% reads on 1:4 nodes, 8 GB leader data/node, no disk reads).
         cache_at_1_4 = self.vcpu_per_node * 4 * DEFAULTS["cache_fraction_of_ram"]
-        read_heavy = self.write_pct < 50
+        read_heavy = self.write_pct < 50 or self._analytics_on_primary()
         base_ratio = 8 if read_heavy and self._hot_data_gb(nodes) > cache_at_1_4 else 4
         base_gb    = self.vcpu_per_node * base_ratio
         conn_gb    = self.conn_per_node * self.mem_mb_per_conn / 1024
@@ -743,6 +786,25 @@ class _Sizing:
         hot = self._hot_data_gb(nodes)
         return max(0.0, 1 - cache_gb / hot) if hot else 0.0
 
+    def _scan_io(self, data_gb_per_node, cache_gb, nodes):
+        """(MiB/s, IOPS) per node of analytical scans that miss the cache, as large sequential reads."""
+        if not self.analytics_on:
+            return 0.0, 0.0
+        miss = max(0.0, 1 - cache_gb / data_gb_per_node) if data_gb_per_node else 0.0
+        scanned = (self.analytics_qps * self.analytics_rows * self.avg_row_bytes
+                   * (1 - self.compression_ratio) / nodes / 1_048_576)
+        mibps = scanned * miss
+        return mibps, mibps * 1024 / DEFAULTS["scan_io_kib"]
+
+    def _primary_scan_io(self, nodes):
+        if not self._analytics_on_primary():
+            return 0.0, 0.0
+        serving = nodes if self.analytics_target == "followers" else self._serving_nodes(nodes)
+        data = (self.with_replication / nodes if self.analytics_target == "followers"
+                else self._leader_data_gb(nodes))
+        cache = self._memory(nodes)["mem_per_node_gb"] * DEFAULTS["cache_fraction_of_ram"]
+        return self._scan_io(data, cache, serving)
+
     def _io_raw(self, nodes):
         replica_writes = self.write_ops * self.rf / nodes
         miss = self._read_cache_miss(nodes)
@@ -753,7 +815,8 @@ class _Sizing:
         read_iops  = (leader_reads / self._serving_nodes(nodes) + follower_reads / nodes) * miss
         disk_mibps = (replica_writes * self.avg_row_bytes * (1 + self.index_overhead)
                       * self.disk_write_amp / 1_048_576)
-        return write_iops, read_iops, disk_mibps, miss
+        scan_mibps, scan_iops = self._primary_scan_io(nodes)
+        return write_iops, read_iops + scan_iops, disk_mibps + scan_mibps, miss
 
     def _disk_fits(self, nodes):
         write_iops, read_iops, disk_mibps, _ = self._io_raw(nodes)
@@ -771,6 +834,7 @@ class _Sizing:
                                        else "cache vs leader data"),
             "leader_data_gb_per_node": round(self._leader_data_gb(nodes), 1),
             "hot_data_gb_per_node": round(self._hot_data_gb(nodes), 1),
+            "scan_mibps_per_node": round(self._primary_scan_io(nodes)[0], 1),
             "disk_iops_limit": self.disk_iops_limit,
             "disk_mibps_limit": self.disk_mibps_limit,
             "disk_nodes_added": self.disk_nodes_added,
@@ -963,23 +1027,43 @@ class _Sizing:
     # applies every write once per copy, at the follower apply cost. Not part of the RF quorum.
 
     def _read_replica(self):
-        if not self.rr_frac:
+        analytics_here = self.analytics_on and self.analytics_target == "read-replica"
+        if not self.rr_frac and not analytics_here:
             return None
         v, copies = self.rr_vcpu, self.rr_rf
         m = self.workload_multiplier * self.rpc_multiplier * self.arch_factor
         reads = self.read_ops * self.rr_frac
         follower_apply = self.cpu_ms_write * self.rf_write_scale * (1 - self._leader_write_portion()) / (self.rf - 1)
         cores = (reads * self.cpu_ms_read + self.write_ops * follower_apply * copies) * m / 1000
+        scan_cores = self._analytics_cores() if analytics_here else 0.0
+        cores += scan_cores
         conn_cpu = self._conn_cpu_per_node(v)
+
+        def shape(n):
+            """Per-node memory, cache miss and I/O for an n-node replica cluster."""
+            data = self.after_compression * copies / n
+            ratio = 8 if data > v * 4 * DEFAULTS["cache_fraction_of_ram"] else 4
+            mem = round_up_to_ram_tier(v * ratio, self.ram_tier_tolerance)
+            cache = mem * DEFAULTS["cache_fraction_of_ram"]
+            miss = max(0.0, 1 - cache / data) if data else 0.0
+            scan_mibps, scan_iops = self._scan_io(data, cache, n) if analytics_here else (0.0, 0.0)
+            iops = self.write_ops * copies / n * self.iops_per_replica_write + reads / n * miss + scan_iops
+            write_mibps = (self.write_ops * copies / n * self.avg_row_bytes * (1 + self.index_overhead)
+                           * self.disk_write_amp / 1_048_576)
+            return data, mem, scan_mibps, iops, write_mibps + scan_mibps
+
+        # CPU first, then disk limits (as for the primary), in multiples of the copy count
         nodes = round_up_to_rf_multiple(math.ceil(cores / self.target_cpu_util / v), copies)
         while (cores + conn_cpu * nodes) / (nodes * v) > self.target_cpu_util:
             nodes += copies
+        disk_added = 0
+        while True:
+            data_gb, mem, scan_mibps, iops, disk_mibps = shape(nodes)
+            if iops <= self.disk_iops_limit and disk_mibps <= self.disk_mibps_limit:
+                break
+            nodes += copies
+            disk_added += copies
         util = (cores + conn_cpu * nodes) / (nodes * v)
-        data_gb = self.after_compression * copies / nodes
-        ratio = 8 if data_gb > v * 4 * DEFAULTS["cache_fraction_of_ram"] else 4
-        mem = round_up_to_ram_tier(v * ratio, self.ram_tier_tolerance)
-        miss = max(0.0, 1 - mem * DEFAULTS["cache_fraction_of_ram"] / data_gb) if data_gb else 0.0
-        writes_per_node = self.write_ops * copies / nodes
         storage = data_gb * (1 + self.compaction_reserve) + (
             self.write_ops * copies * self.avg_row_bytes * (1 + self.index_overhead)
             * self.wal_retention_secs / nodes / 1024 ** 3)
@@ -995,8 +1079,11 @@ class _Sizing:
             "cpu_utilization_pct": round(util * 100, 1),
             "mem_per_node_gb": mem,
             "storage_per_node_gb": round(storage, 1),
-            "iops_per_node": round(writes_per_node * self.iops_per_replica_write
-                                   + reads / nodes * miss, 0),
+            "iops_per_node": round(iops, 0),
+            "disk_mibps_per_node": round(disk_mibps, 1),
+            "disk_nodes_added": disk_added,
+            "analytics_cores": round(scan_cores, 2),
+            "scan_mibps_per_node": round(scan_mibps, 1),
             "replication_ingest_mbps": round(ingest, 2),
         }
 
@@ -1047,6 +1134,7 @@ class _Sizing:
                 "region_rtt_ms": self.region_rtt_ms,
                 "preferred_region": self.preferred_region,
                 "write_pipelining": self.write_pipelining,
+                "analytics_target": self.analytics_target if self.analytics_on else None,
             },
             "parameters": {
                 "rpc_overhead": self.rpc_overhead,
@@ -1114,6 +1202,7 @@ class _Sizing:
             "ttl": ttl_info,
             "concurrency": self._concurrency(nodes),
             "transactions": self._txn_summary(),
+            "analytics": self._analytics_summary(nodes),
             "read_replica": self._read_replica(),
             "multi_region": self._multi_region(nodes),
         }
@@ -1130,6 +1219,23 @@ class _Sizing:
             "overhead_basis": ("added: commit + intents per distributed write transaction" if t["applies"]
                                else f"included in the {self.workload} profile"
                                if self.cpu_model == "per-op" else "not modeled (legacy CPU model)"),
+        }
+
+    def _analytics_summary(self, nodes):
+        if not self.analytics_on:
+            return None
+        cores = self._analytics_cores()
+        rows_per_s = self.analytics_qps * self.analytics_rows
+        return {
+            "queries_per_s": self.analytics_qps,
+            "rows_per_query": self.analytics_rows,
+            "rows_scanned_per_s": round(rows_per_s, 0),
+            "assumed": self.analytics_assumed,
+            "target": self.analytics_target,
+            "cores": round(cores, 2),
+            "cpu_s_per_query": round(cores / self.analytics_qps, 2) if self.analytics_qps else 0,
+            "scan_cpu_us_per_row": self.scan_cpu_us_per_row,
+            "primary_scan_mibps_per_node": round(self._primary_scan_io(nodes)[0], 1),
         }
 
     def _multi_region(self, nodes):
@@ -1533,6 +1639,24 @@ def format_report(r):
                      " — rerun with --size-for zone to size for it.")
         lines.append("")
 
+    an = r.get("analytics")
+    if an:
+        where = {"primary": "primary cluster (competes with OLTP for CPU and cache)",
+                 "followers": "follower reads on the primary (spread over all replicas, bounded staleness)",
+                 "read-replica": "read-replica cluster (isolated from OLTP)"}[an["target"]]
+        lines += ["ANALYTICS (HTAP)", "─" * 44,
+                  f"  Analytical queries:          {an['queries_per_s']:g}/s × {an['rows_per_query']:,} rows scanned"
+                  + ("  ⚠️ assumed — pass --analytics-qps/--analytics-rows" if an["assumed"] else ""),
+                  f"  Scan CPU:                    {an['cores']} cores  ({an['scan_cpu_us_per_row']:g} µs/row; "
+                  f"~{an['cpu_s_per_query']:g} CPU-s per query)",
+                  f"  Served by:                   {where}"]
+        if an["target"] != "read-replica":
+            lines.append(f"  Scan disk reads / node:      {an['primary_scan_mibps_per_node']:,} MiB/s (cache misses)")
+        if an["target"] == "primary":
+            lines.append("  • Scans compete with OLTP and can evict its cache — consider --analytics-target "
+                         "followers or read-replica.")
+        lines.append("")
+
     mr = r.get("multi_region")
     if mr:
         lines += ["MULTI-REGION", "─" * 44,
@@ -1553,12 +1677,15 @@ def format_report(r):
     if rr:
         lines += ["READ REPLICA CLUSTER", "─" * 44,
                   f"  Serves:                      {rr['read_pct']:g}% of reads ({rr['reads_per_s']:,.0f}/s), "
-                  f"{rr['copies']} cop{'y' if rr['copies'] == 1 else 'ies'} of the data",
+                  f"{rr['copies']} cop{'y' if rr['copies'] == 1 else 'ies'} of the data"
+                  + (f", analytics ({rr['analytics_cores']} cores)" if rr["analytics_cores"] else ""),
                   f"  Nodes:                       {rr['nodes']} × {rr['vcpu_per_node']} vCPU  "
                   f"({rr['cpu_utilization_pct']}% CPU, incl. applying every write)",
                   f"  Memory / node:               {rr['mem_per_node_gb']} GB",
                   f"  Storage / node:              {rr['storage_per_node_gb']:,} GB",
                   f"  IOPS / node:                 {int(rr['iops_per_node']):,}",
+                  f"  Disk throughput / node:      {rr['disk_mibps_per_node']:,} MiB/s"
+                  + (f"  (+{rr['disk_nodes_added']} node(s) added for disk limits)" if rr["disk_nodes_added"] else ""),
                   f"  Replication ingest:          {rr['replication_ingest_mbps']:,} MiB/s (usually cross-region)",
                   "  • Timeline-consistent reads; not part of the RF quorum. YSQL reads need",
                   "    yb_read_from_followers and read-only transactions.", ""]
@@ -1954,6 +2081,15 @@ def format_html(r, comparison=None):
             f"<li>Set <code>--ysql_max_connections={c['conn_per_node']}</code> to cap backends per node; raise "
             "<code>--ysql_conn_mgr_max_client_connections</code> (default 10000) if apps need more.</li>"
             "<li>Avoid session state that makes connections sticky (SQL-level PREPARE, temp tables).</li></ul>"))
+    an = r.get("analytics")
+    if an:
+        sections.append(card("Analytics (HTAP)", kv([
+            ("Analytical queries", f"{an['queries_per_s']:g}/s × {an['rows_per_query']:,} rows"
+             + (" (assumed)" if an["assumed"] else "")),
+            ("Scan CPU", f"{an['cores']} cores ({an['scan_cpu_us_per_row']:g} µs/row)"),
+            ("Served by", an["target"]),
+            ("Scan disk reads / node", f"{an['primary_scan_mibps_per_node']:,} MiB/s"),
+        ])))
     mr = r.get("multi_region")
     if mr:
         rows = [("Regions", f"{mr['regions']} × {mr['nodes_per_region']} nodes, {mr['region_rtt_ms']:g} ms RTT"),
@@ -1973,6 +2109,8 @@ def format_html(r, comparison=None):
             ("Memory / node", f"{rr['mem_per_node_gb']} GB"),
             ("Storage / node", f"{rr['storage_per_node_gb']:,} GB"),
             ("IOPS / node", f"{int(rr['iops_per_node']):,}"),
+            ("Disk throughput / node", f"{rr['disk_mibps_per_node']:,} MiB/s"
+             + (f" (+{rr['disk_nodes_added']} nodes for disk)" if rr["disk_nodes_added"] else "")),
             ("Replication ingest", f"{rr['replication_ingest_mbps']:,} MiB/s"),
         ]) + "<p class='note'>Timeline-consistent reads; outside the RF quorum.</p>"))
     if is_ycql:
@@ -2076,7 +2214,7 @@ def main():
     parser.add_argument("--cpu-model",           choices=CPU_MODELS, default="per-op",
                         help="per-op (default): measured CPU per operation; latency: legacy ops × exec time")
     parser.add_argument("--workload",            default=None,
-                        help="Workload profile — YSQL: kv | oltp | complex | analytics; YCQL: point | range | lwt "
+                        help="Workload profile — YSQL: kv | oltp | complex | analytics | htap; YCQL: point | range | lwt "
                              "(default: auto from the read/write mix)")
     parser.add_argument("--cpu-ms-per-read",     type=float, default=None,
                         help=f"Override CPU ms per read (default: YSQL {CPU_COST_PROFILES['ysql']['read']}, YCQL {CPU_COST_PROFILES['ycql']['read']})")
@@ -2096,6 +2234,14 @@ def main():
     parser.add_argument("--regions",             type=int,   default=None, help="1 (default) or RF: one replica per region (synchronous multi-region cluster)")
     parser.add_argument("--region-rtt-ms",       type=float, default=None, help=f"Cross-region round trip in ms (default {DEFAULTS['region_rtt_ms']})")
     parser.add_argument("--preferred-region",    action="store_true", default=False, help="Pin all tablet leaders to one region")
+    parser.add_argument("--analytics-qps",       type=float, default=None,
+                        help=f"HTAP: analytical queries/s (default with --workload htap: {DEFAULTS['htap_default_analytics_qps']:g})")
+    parser.add_argument("--analytics-rows",      type=int,   default=None,
+                        help=f"HTAP: rows scanned per analytical query (default with --workload htap: {DEFAULTS['htap_default_rows_per_query']:,})")
+    parser.add_argument("--analytics-target",    choices=ANALYTICS_TARGETS, default="primary",
+                        help="Where analytical queries run: primary (default), followers, or read-replica")
+    parser.add_argument("--scan-cpu-us-per-row", type=float, default=None,
+                        help=f"CPU µs per row scanned with pushdown (default {DEFAULTS['scan_cpu_us_per_row']:g})")
     parser.add_argument("--write-pipelining",    action="store_true", default=False,
                         help="YSQL: ysql_enable_write_pipelining — writes replicate in the background; ~2 round trips per transaction")
     parser.add_argument("--cross-region-cost-per-gb", type=float, default=None, help=f"Inter-region transfer price per GB (default {DEFAULTS['cross_region_cost_per_gb']})")
@@ -2217,6 +2363,10 @@ def main():
         preferred_region=args.preferred_region,
         cross_region_cost_per_gb=args.cross_region_cost_per_gb,
         write_pipelining=args.write_pipelining,
+        analytics_qps=args.analytics_qps,
+        analytics_rows=args.analytics_rows,
+        analytics_target=args.analytics_target,
+        scan_cpu_us_per_row=args.scan_cpu_us_per_row,
     )
 
     try:

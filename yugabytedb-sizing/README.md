@@ -18,6 +18,7 @@ Choosing the right cluster size for YugabyteDB requires balancing CPU, memory, s
 | **Topology** | Multi-AZ by default (one zone per replica); single-AZ; multi-region with balanced or pinned (preferred-region) leaders, cross-region latency and transfer cost |
 | **Transactions** | TPS × statements per transaction; distributed-transaction overhead (commit + intents) on fast-path profiles; YSQL write pipelining for cross-region latency |
 | **Read offload** | Follower reads and a separately sized read-replica cluster |
+| **HTAP** | OLTP plus analytical scans (queries/s × rows scanned), on the primary, followers or an isolated read replica |
 | **Growth Projection** | 1-year and 2-year storage forecasts based on configurable annual growth rate; YCQL TTL caps growth at the steady state |
 | **Tablet Overhead** | CPU/RAM for tablet maintenance — tablets from automatic splitting of the data, or from schema (YSQL 1 tablet/table, YCQL 1 tablet/tserver/table) if larger |
 | **Failure Resilience** | CPU utilization after losing one node or one zone; optionally sizes the cluster so a zone loss stays within target |
@@ -97,6 +98,10 @@ Only observed QPS and CPU% are required; if the PoC shape isn't given, it's assu
 **Multi-region with follower reads** — leaders pinned near the app, stale-tolerant reads served locally:
 
 > *"Size a 3-region YugabyteDB cluster for 20,000 QPS (70% reads), 500 GB, with leaders in us-east and 40% of reads as follower reads."*
+
+**HTAP** — OLTP plus analytical queries, isolated on a read replica:
+
+> *"Size for 20,000 QPS of OLTP (70% reads, 500 GB) plus reporting queries — about 5 per second, each scanning ~2M rows. Keep analytics off the transactional nodes."*
 
 **Sizing with CDC and xCluster** (CDC is YSQL only) — the skill accounts for additional CPU overhead when Change Data Capture (CDC) or cross-cluster replication (xCluster) is enabled:
 

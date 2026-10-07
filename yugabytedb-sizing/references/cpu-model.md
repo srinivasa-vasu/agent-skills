@@ -44,6 +44,7 @@ YugabyteDB software improvements. Replace it with a current YCQL run when one ex
 | YSQL | `oltp` | 1.0× (measured baseline) | Transactional OLTP with indexes, multi-statement transactions (TPC-C-like) | otherwise |
 | YSQL | `complex` | 2.0× | Joins / aggregations | Read% ≥ 70 |
 | YSQL | `analytics` | 5.0× | Scans / reporting queries | Read% ≥ 90 |
+| YSQL | `htap` | 1.0× + scan CPU | OLTP statements at the `oltp` cost, plus analytical scans (below) | never (pass it) |
 | YCQL | `point` | 1.0× (measured baseline) | Reads/writes by full primary key | otherwise |
 | YCQL | `range` | 2.7× | Single-partition range reads (clustering-key ranges) | Read% ≥ 90 |
 | YCQL | `lwt` | 4.0× | Lightweight transactions (`IF NOT EXISTS`/`IF`) or writes to indexed tables | never (pass it) |
@@ -84,6 +85,29 @@ YCQL `lwt`. The 1.0 / 1.0 unit costs are estimates; calibrate when the user has 
   region carries every leader read and leader write while the others only apply follower writes.
   Each region is sized for the leader load (it must take over on failover), which can multiply
   node count; follower reads move reads back to the other regions.
+
+## HTAP analytics (`--workload htap`, `--analytics-*`)
+
+Analytical queries are sized by rows scanned, not per statement:
+```
+Scan cores = analytical queries/s × rows scanned per query × 2 µs/row × arch × hardware scale
+```
+The 2 µs/row assumes filters and aggregates are pushed down to DocDB (`Remote Filter`,
+`Partial Aggregate`). A single-stream filtered scan of 38.9M wide (320-byte) rows took ~81 s of
+storage time (≈2.1 µs/row, GitHub #32973); parallel `COUNT(*)` scans reach 1.5–7.5M rows/s on
+3-node clusters. Queries that pull rows into PostgreSQL (joins, sorts, hash aggregates) cost more —
+raise `--scan-cpu-us-per-row` or calibrate.
+
+Where the scans run (`--analytics-target`):
+- `primary` (default): scan CPU is added to the OLTP cluster; scanned data that misses the cache
+  (leader data vs half the RAM) becomes disk reads at 256 KiB per IOP. Scans also evict the OLTP
+  working set.
+- `followers`: the same CPU, spread over all replicas (read-only, bounded staleness); each node now
+  serves all of its replicas, so the cached working set widens and more scans hit disk.
+- `read-replica`: scans move to the read-replica cluster, sized for scan CPU, follower applies and
+  its own disk limits — the OLTP cluster is untouched.
+
+Without inputs, `--workload htap` assumes 1 query/s × 1M rows and flags it.
 
 ## Adjustments
 

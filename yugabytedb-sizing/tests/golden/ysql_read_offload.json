@@ -1,4 +1,5 @@
 {
+  "analytics": null,
   "calibration": null,
   "cluster": {
     "client_conn_per_node": 256,
@@ -31,6 +32,7 @@
     }
   },
   "inputs": {
+    "analytics_target": null,
     "api": "ysql",
     "avg_exec_ms": null,
     "avg_row_bytes": 512,
@@ -78,6 +80,7 @@
     "read_cache_miss_pct": 77.1,
     "read_cache_miss_source": "cache vs leader data",
     "read_iops_per_node": 2880.0,
+    "scan_mibps_per_node": 0.0,
     "total_iops_per_node": 4350.0,
     "write_iops_per_node": 1470.0
   },
@@ -142,14 +145,18 @@
     "xcluster_overhead_pct": null
   },
   "read_replica": {
+    "analytics_cores": 0.0,
     "copies": 1,
     "cpu_utilization_pct": 40.1,
+    "disk_mibps_per_node": 66.8,
+    "disk_nodes_added": 0,
     "iops_per_node": 3843.0,
     "mem_per_node_gb": 128,
     "nodes": 1,
     "read_pct": 20.0,
     "reads_per_s": 2800.0,
     "replication_ingest_mbps": 40.72,
+    "scan_mibps_per_node": 0.0,
     "storage_per_node_gb": 507.1,
     "total_vcpu": 16,
     "vcpu_per_node": 16,

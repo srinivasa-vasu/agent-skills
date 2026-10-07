@@ -31,6 +31,8 @@ default.
 | Distributed transactions | 100% of write txns if > 1 statement, else 0% | `--distributed-txn-pct` |
 | Distributed-txn cost | commit 1.0 + intent 1.0 fast-path writes | Added to fast-path profiles only (`kv`, `point`, `range`) |
 | Write pipelining | off (YSQL default) | `--write-pipelining`; latency only — the report always shows the alternative |
+| HTAP analytics | off; `--workload htap` assumes 1 q/s × 1M rows | `--analytics-qps`, `--analytics-rows`, `--analytics-target` (primary / followers / read-replica) |
+| Scan CPU | 2 µs per row scanned (pushdown) | `--scan-cpu-us-per-row` |
 | Follower reads | 0% | `--follower-read-pct` |
 | Read replicas | 0% of reads, 1 copy, same vCPU | `--read-replica-read-pct`, `--read-replica-rf`, `--read-replica-vcpu` |
 | Target CPU utilization | 65% | `--target-cpu-util`; includes connection and tablet CPU |

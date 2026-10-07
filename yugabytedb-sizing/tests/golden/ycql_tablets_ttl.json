@@ -1,4 +1,5 @@
 {
+  "analytics": null,
   "calibration": null,
   "cluster": {
     "client_conn_per_node": 0,
@@ -31,6 +32,7 @@
     }
   },
   "inputs": {
+    "analytics_target": null,
     "api": "ycql",
     "avg_exec_ms": null,
     "avg_row_bytes": 512,
@@ -78,6 +80,7 @@
     "read_cache_miss_pct": 91.7,
     "read_cache_miss_source": "cache vs leader data",
     "read_iops_per_node": 9169.0,
+    "scan_mibps_per_node": 0.0,
     "total_iops_per_node": 14069.0,
     "write_iops_per_node": 4900.0
   },

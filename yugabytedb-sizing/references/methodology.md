@@ -152,10 +152,22 @@ single-row writes still pay one round trip. CPU is unchanged; lower latency mean
 in flight. Pass a latency measured in the target topology with `--region-rtt-ms 0` to avoid adding
 it twice.
 
+## HTAP analytics
+```
+Scan cores        = analytical q/s × rows/query × 2 µs/row × arch × hardware scale
+Scanned MiB/s     = q/s × rows × row size × 0.70 (compressed) / serving nodes
+Scan disk MiB/s   = Scanned MiB/s × max(0, 1 − cache / scanned data per node)
+Scan IOPS         = Scan disk MiB/s × 1024 / 256            (256 KiB sequential I/Os)
+```
+Added to the primary (`primary`, `followers`) or to the read-replica cluster (`read-replica`), and
+included in the disk-limit checks of whichever cluster runs them. On the primary, analytics also
+make the memory rule treat the workload as read-heavy (1:8 when its data doesn't fit a 1:4 cache).
+
 ## Read-replica cluster
 ```
 CPU     = replica reads × ms/read + writes × follower apply × copies       (× workload × RPC × arch)
-Nodes   = smallest multiple of copies with (CPU + connection CPU) ≤ 65%
+Nodes   = smallest multiple of copies with (CPU + connection CPU) ≤ 65%,
+          then more until IOPS and disk MiB/s (applies + scans) fit the disk limits
 Storage = Compressed × copies / nodes × 1.20 + WAL
 Memory  = 1:4, or 1:8 if its data/node doesn't fit a 1:4 node's cache
 ```
