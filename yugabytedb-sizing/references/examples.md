@@ -1,8 +1,5 @@
 # Worked Examples
 
-Both examples are pinned by the test suite (`tests/golden/ysql_reference.json`,
-`tests/golden/ycql_reference.json`).
-
 ## YSQL
 
 **Input**: 10,000 QPS, 30% write / 70% read, `--workload oltp`, 5 ms latency, RF=3,

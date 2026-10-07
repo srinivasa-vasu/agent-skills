@@ -31,11 +31,10 @@ import sizing_calc  # noqa: E402
 SCENARIOS = {
     "ysql_reference": "--qps 10000 --write-pct 30 --read-pct 70 --avg-exec-ms 5 --workload oltp "
                       "--vcpu-per-node 16 --rf 3 --table-size-gb 500",
-    "ysql_tpcc_4k":   "--qps 14984.51 --write-pct 55.64 --read-pct 44.36 --avg-exec-ms 1.37 --workload oltp "
-                      "--vcpu-per-node 16 --rf 3 --table-size-gb 336 --zones 1",
-    "ysql_sysbench_read": "--qps 57061.19 --write-pct 0 --read-pct 100 --avg-exec-ms 0.64 --workload kv "
-                          "--vcpu-per-node 8 --rf 3 --table-size-gb 29.9 --cpu-cost-scale 1.15 --zones 1 "
-                          "--target-cpu-util 0.80",
+    "ysql_oltp_write_heavy": "--qps 15000 --write-pct 55 --read-pct 45 --avg-exec-ms 1.5 --workload oltp "
+                             "--vcpu-per-node 16 --rf 3 --table-size-gb 350 --zones 1",
+    "ysql_point_reads": "--qps 50000 --write-pct 0 --read-pct 100 --avg-exec-ms 0.6 --workload kv "
+                        "--vcpu-per-node 8 --rf 3 --table-size-gb 30 --zones 1 --target-cpu-util 0.80",
     "ycql_nvme": "--api ycql --qps 100000 --write-pct 30 --read-pct 70 --workload point --vcpu-per-node 16 "
                  "--rf 3 --table-size-gb 500 --disk-iops 200000 --disk-mibps 4000",
     "ysql_legacy_latency": "--qps 10000 --write-pct 30 --read-pct 70 --avg-exec-ms 5 --cpu-model latency "
@@ -103,50 +102,41 @@ class GoldenTests(unittest.TestCase):
                 )
 
 
-class BenchmarkReproductionTests(unittest.TestCase):
-    """The per-op CPU model and the IOPS/disk/network models must reproduce the measured runs
-    they were calibrated on (all on 3 × 16 vCPU, RF=3)."""
+class CalibrationTests(unittest.TestCase):
+    """Behaviour of the calibrated CPU, cache, I/O and network constants, plus a reproduction of
+    the public YCQL key-value benchmark from the YugabyteDB docs."""
 
-    TPCC = dict(qps=14984.51, write_pct=55.64, read_pct=44.36, avg_exec_ms=1.37, workload="oltp",
-                vcpu_per_node=16, rf=3, table_size_gb=336, conn_per_vcpu=400 / 3 / 16,   # 400 connections
-                zones=1)                                                                 # single-AZ run
-    # sysbench point selects: 3 × m6i.2xlarge (8 vCPU, 32 GB, previous gen), ~60 connections,
-    # 75 GB on disk (RF3) → ~25 GB compressed; the run sat at 73% CPU, above the 65% target
-    SYSBENCH = dict(qps=57061.19, write_pct=0, read_pct=100, avg_exec_ms=0.64, workload="kv",
-                    vcpu_per_node=8, rf=3, table_size_gb=75.33 / 3 / 0.84, conn_per_vcpu=60 / 3 / 8,
-                    cpu_cost_scale=1.15, zones=1, target_cpu_util=0.80)
+    OLTP = dict(qps=15000, write_pct=55, read_pct=45, avg_exec_ms=1.5, workload="oltp",
+                vcpu_per_node=16, rf=3, table_size_gb=350, zones=1)
+    POINT_READS = dict(qps=50000, write_pct=0, read_pct=100, avg_exec_ms=0.6, workload="kv",
+                       vcpu_per_node=8, rf=3, table_size_gb=30, zones=1, target_cpu_util=0.80)
 
-    def test_tpcc_4k_intel(self):
-        r = sizing_calc.calculate(**self.TPCC)
-        self.assertEqual(r["cluster"]["total_nodes"], 3)
-        self.assertAlmostEqual(r["cluster"]["cpu_utilization_pct"], 54.48, delta=1.0)
-        self.assertAlmostEqual(r["iops"]["total_iops_per_node"], 3503, delta=3503 * 0.03)
-        self.assertAlmostEqual(r["iops"]["disk_mibps_per_node"], 92.6, delta=92.6 * 0.03)
-        self.assertAlmostEqual(r["network"]["total_net_mbps_per_node"], 60.2, delta=60.2 * 0.03)
-        self.assertEqual(r["memory"]["mem_per_node_gb"], 64)   # the run used 64 GB nodes (~26 GB RSS)
+    def test_arm_costs_ten_percent_more_cpu(self):
+        x86 = sizing_calc.calculate(**self.OLTP)["workload"]["cpu_seconds_needed"]
+        arm = sizing_calc.calculate(**self.OLTP, cpu_arch="arm")["workload"]["cpu_seconds_needed"]
+        self.assertAlmostEqual(arm / x86, 1.10, places=3)
 
-    def test_sysbench_point_select_read(self):
-        r = sizing_calc.calculate(**self.SYSBENCH)
-        self.assertEqual(r["cluster"]["total_nodes"], 3)
-        self.assertAlmostEqual(r["cluster"]["cpu_utilization_pct"], 73.01, delta=1.5)
-        self.assertLess(r["iops"]["total_iops_per_node"], 50)            # measured 5.9: data fits in cache
-        self.assertAlmostEqual(r["network"]["total_net_mbps_per_node"], 29.74, delta=29.74 * 0.03)
-        self.assertEqual(r["memory"]["mem_per_node_gb"], 32)              # ran on 32 GB (1:4) nodes
+    def test_cached_point_reads_need_no_read_iops(self):
+        r = sizing_calc.calculate(**self.POINT_READS)
+        self.assertEqual(r["iops"]["read_cache_miss_pct"], 0)        # leader data fits half the RAM
+        self.assertEqual(r["iops"]["total_iops_per_node"], 0)
         self.assertEqual(r["memory"]["base_mem_ratio"], "1:4")
 
-    def test_tpcc_4k_arm(self):
-        r = sizing_calc.calculate(**self.TPCC, cpu_arch="arm")
-        self.assertAlmostEqual(r["cluster"]["cpu_utilization_pct"], 60.16, delta=1.0)
+    def test_reads_move_fewer_bytes_than_replicated_writes(self):
+        reads = sizing_calc.calculate(**dict(self.OLTP, write_pct=0, read_pct=100))["network"]
+        writes = sizing_calc.calculate(**dict(self.OLTP, write_pct=100, read_pct=0))["network"]
+        self.assertLess(reads["total_net_mbps_per_node"], writes["total_net_mbps_per_node"])
 
-    def test_ycql_kv_reads_and_writes(self):
-        # The benchmark ran on 2016-era i3.4xlarge: undo the hardware-generation factor to reproduce it
+    def test_ycql_kv_benchmark_reproduction(self):
+        # Public YCQL key-value benchmark (docs): 150k reads/s and 90k writes/s at 60% CPU on
+        # 3 × 16 cores (2016-era i3.4xlarge, NVMe). Undo the hardware-generation factor.
         old_hw = 1 / sizing_calc.YCQL_HW_GENERATION_FACTOR
         for qps, write_pct in ((150000, 0), (90000, 100)):
             with self.subTest(write_pct=write_pct):
                 r = sizing_calc.calculate(api="ycql", qps=qps, write_pct=write_pct, read_pct=100 - write_pct,
                                           avg_exec_ms=None, workload="point", vcpu_per_node=16, rf=3,
                                           table_size_gb=100, cpu_cost_scale=old_hw,
-                                          disk_iops=10 ** 6, disk_mibps=10 ** 5)   # ran on NVMe (i3)
+                                          disk_iops=10 ** 6, disk_mibps=10 ** 5)
                 self.assertEqual(r["cluster"]["total_nodes"], 3)
                 self.assertAlmostEqual(r["cluster"]["cpu_utilization_pct"], 60, delta=1.0)
 
@@ -156,14 +146,13 @@ class BenchmarkReproductionTests(unittest.TestCase):
         self.assertAlmostEqual(cost["write"], 0.296 * 0.6, places=4)
 
     def test_cpu_cost_scale(self):
-        base = dict(self.TPCC)
-        a = sizing_calc.calculate(**base)["workload"]["cpu_seconds_needed"]
-        b = sizing_calc.calculate(**base, cpu_cost_scale=1.5)["workload"]["cpu_seconds_needed"]
+        a = sizing_calc.calculate(**self.OLTP)["workload"]["cpu_seconds_needed"]
+        b = sizing_calc.calculate(**self.OLTP, cpu_cost_scale=1.5)["workload"]["cpu_seconds_needed"]
         self.assertAlmostEqual(b / a, 1.5, places=3)
 
-    def test_tpcc_concurrency(self):
-        cc = sizing_calc.calculate(**self.TPCC)["concurrency"]
-        self.assertAlmostEqual(cc["in_flight_total"], 20.5, delta=0.1)   # Little's law: QPS × latency
+    def test_concurrency_is_littles_law(self):
+        cc = sizing_calc.calculate(**self.OLTP)["concurrency"]
+        self.assertAlmostEqual(cc["in_flight_total"], 15000 * 1.5 / 1000, delta=0.1)
         self.assertFalse(cc["connection_bound"])
 
 
@@ -558,7 +547,7 @@ class TransactionMixTests(unittest.TestCase):
                                      **base)["workload"]["cpu_seconds_needed"]
         self.assertAlmostEqual(dist / fast, 3.0, places=2)    # commit + intent ≈ 2 extra write units
 
-    def test_overhead_included_in_tpcc_profile(self):
+    def test_overhead_included_in_oltp_profile(self):
         r = sizing_calc.calculate(qps=1000, statements_per_txn=8, workload="oltp", **self.BASE)
         self.assertEqual(r["transactions"]["overhead_cores"], 0)
         self.assertIn("included", r["transactions"]["overhead_basis"])

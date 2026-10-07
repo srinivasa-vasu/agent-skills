@@ -41,8 +41,8 @@ DEFAULTS = {
     "compaction_reserve":  0.20,   # 20% free space for LSM compaction
     "target_cpu_util":     0.65,   # 65% max sustained CPU utilization
     "cache_fraction_of_ram": 0.5,  # RAM that ends up caching data (block cache + OS page cache)
-    # Calibrated at the default 512-byte row from TPC-C 4k (3× m8i.4xlarge) and sysbench
-    # point selects (3× m6i.2xlarge), YB 2026.1, gp3:
+    # Calibrated at the default 512-byte row from YugabyteDB benchmark runs (transactional OLTP
+    # and point-select workloads, YB 2026.1, gp3):
     "iops_per_replica_write": 0.245,  # disk IOPS per replicated write (WAL group commit + batched flushes)
     "disk_write_amp":      19,     # disk bytes per replicated written byte (WAL + flush + compaction + reads)
     "net_write_factor":    13.9,   # NIC bytes per row-byte per replicated write (Raft, intents, txn status, TLS)
@@ -90,7 +90,7 @@ API_PROFILES = {
         "rpc_overhead":      0.15,   # RPC, retries, joins, index lookups, auto-analyze (applied as 1 + rpc_overhead)
         "index_overhead":    0.20,   # 20% extra storage for indexes
         "conn_per_vcpu":     16,     # PostgreSQL connections per vCPU
-        "mem_mb_per_conn":   15,     # MB per PostgreSQL backend (TPC-C: 1,952 MB PSS / 133 backends per node)
+        "mem_mb_per_conn":   15,     # MB per PostgreSQL backend (PSS measured under OLTP load)
         "conn_cpu_overhead": 0.002,  # CPU cores consumed per connection (~0.2%)
     },
     "ycql": {
@@ -118,29 +118,30 @@ EXEC_TIME_ESTIMATES = {
     ],
 }
 
-# CPU milliseconds per client operation at RF=3 on current-generation hardware (m8i/m8g class),
-# before the RPC/retry multiplier. Derived from measured runs: busy cores − connection CPU −
+# CPU milliseconds per client operation at RF=3 on current-generation hardware (m7i/m8i/m8g class),
+# before the RPC/retry multiplier. Derived from benchmark runs: busy cores − connection CPU −
 # tablet CPU, ÷ RPC multiplier; YSQL's read/write split uses YCQL's write:read cost ratio (1.67).
-# The YCQL run is from 2016-era i3.4xlarge (Broadwell) on an older YB release, so its measured
+# YSQL: a TPC-C-style transactional benchmark on YB 2026.1. YCQL: the public key-value benchmark
+# from the YugabyteDB docs, run on 2016-era i3.4xlarge (Broadwell) with an older release, so its
 # costs are scaled by YCQL_HW_GENERATION_FACTOR (≈1.67× per-vCPU throughput from CPU generations
 # alone; software gains not counted).
 YCQL_MEASURED = {"read": 0.178, "write": 0.296}
 YCQL_HW_GENERATION_FACTOR = 0.6
 CPU_COST_PROFILES = {
     "ysql": {"read": 1.070, "write": 1.784,
-             "source": "TPC-C 4k, YB 2026.1, 3× m8i.4xlarge, RF3, 400 conns: 14,985 stmt/s (56% writes) at 54.5% CPU"},
+             "source": "TPC-C-style transactional benchmark, YB 2026.1, RF3, current-generation x86"},
     "ycql": {"read": round(YCQL_MEASURED["read"] * YCQL_HW_GENERATION_FACTOR, 4),
              "write": round(YCQL_MEASURED["write"] * YCQL_HW_GENERATION_FACTOR, 4),
              "source": "YCQL key-value benchmark (3× i3.4xlarge, RF3: 150k reads/s, 90k writes/s at 60% CPU) "
                        f"× {YCQL_HW_GENERATION_FACTOR} for current-generation CPUs"},
 }
 
-# Workload profiles: CPU multiplier relative to the API's measured baseline. YSQL kv is measured
-# (sysbench point selects: 0.229 ms/read current-gen vs 1.070 oltp); the others follow the
-# exec-time tiers (YSQL 7–10/20 ms vs mixed 4 ms; YCQL 2/3 ms vs 0.75 ms point).
+# Workload profiles: CPU multiplier relative to the API's measured baseline. YSQL kv comes from a
+# point-select benchmark on YB 2026.1; the others follow the exec-time tiers (YSQL 7–10/20 ms vs
+# mixed 4 ms; YCQL 2/3 ms vs 0.75 ms point).
 WORKLOAD_PROFILES = {
     "ysql": {
-        "kv":        (0.214, "point lookups / single-row writes (sysbench-measured)"),
+        "kv":        (0.214, "point lookups / single-row writes (measured)"),
         "oltp":      (1.0, "transactional OLTP, indexed (TPC-C-like) — baseline"),
         "complex":   (2.0, "joins / aggregations"),
         "analytics": (5.0, "scans / reporting queries"),
@@ -162,7 +163,7 @@ WORKLOAD_AUTO = {  # used when --workload is not given; mirrors the exec-time fa
 FASTPATH_PROFILE = {"ysql": "kv", "ycql": "point"}
 FASTPATH_BASED = {"ysql": {"kv"}, "ycql": {"point", "range"}}
 ANALYTICS_TARGETS = ("primary", "followers", "read-replica")
-CPU_ARCH_FACTORS = {"x86": 1.0, "arm": 1.10}   # Graviton (m8g) used 10% more CPU than m8i for the same TPC-C load
+CPU_ARCH_FACTORS = {"x86": 1.0, "arm": 1.10}   # Graviton used ~10% more CPU than x86 for the same OLTP load
 CPU_MODELS = ("per-op", "latency")
 
 VALID_RF = (1, 3, 5, 7)
@@ -744,7 +745,8 @@ class _Sizing:
 
     def _memory(self, nodes):
         # 1:4 by default; read-heavy workloads whose hot data doesn't fit the cache a 1:4 node
-        # provides get 1:8 (sysbench: 100% reads on 1:4 nodes, 8 GB leader data/node, no disk reads).
+        # provides get 1:8 (a read-only benchmark whose leader data fit in cache ran on 1:4 nodes
+        # with no disk reads).
         cache_at_1_4 = self.vcpu_per_node * 4 * DEFAULTS["cache_fraction_of_ram"]
         read_heavy = self.write_pct < 50 or self._analytics_on_primary()
         base_ratio = 8 if read_heavy and self._hot_data_gb(nodes) > cache_at_1_4 else 4

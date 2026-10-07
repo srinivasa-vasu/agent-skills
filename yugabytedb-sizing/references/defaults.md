@@ -9,11 +9,11 @@ default.
 |---|---|---|---|
 | CPU per read | 1.070 ms | 0.107 ms | `--cpu-ms-per-read`; RF=3, current-gen CPUs, before RPC — see [cpu-model.md](cpu-model.md) |
 | CPU per write | 1.784 ms | 0.178 ms | `--cpu-ms-per-write`; includes replication to 2 followers |
-| Baseline workload | `oltp` | `point` | `--workload`; YSQL `kv` is 0.214× (sysbench-measured) |
+| Baseline workload | `oltp` | `point` | `--workload`; YSQL `kv` is 0.214× (measured) |
 | RPC overhead | 0.15 → 1.15× | 0.08 → 1.08× | `--rpc-overhead`; retries and variance on top of measured costs |
 | Index storage | 20% | 10% | `--index-overhead`; YCQL models are query-first/denormalized |
 | Backends per node | 16 × vCPU (10 × vCPU with Connection Manager) | not modeled | `--conn-per-vcpu`; CQL drivers multiplex requests |
-| Memory per backend | 15 MB | — | `--mem-mb-per-conn`; TPC-C PSS. Counted against PostgreSQL's 27% RAM share first |
+| Memory per backend | 15 MB | — | `--mem-mb-per-conn`; PSS under OLTP load. Counted against PostgreSQL's 27% RAM share first |
 | Connection CPU | 0.2% core per backend | — | `--conn-cpu-overhead` |
 | Tablets per table | 1 (no pre-split) | 1 per tserver | `--tablets-per-table`; YCQL ≤2 cores: 1 per cluster, ≤4 cores: 2 |
 | CDC | +5% CPU, 8 h WAL | not supported | `--cdc`, `--cdc-overhead`, `--cdc-wal-retention-secs` |
@@ -43,8 +43,8 @@ default.
 | Compaction reserve | 20% | `--compaction-reserve` |
 | Max storage per node | 20 TB | `--max-storage-per-node-gb`; nodes added if exceeded |
 | Disk limits per node | 16,000 IOPS, 1,000 MiB/s (gp3 max) | `--disk-iops`, `--disk-mibps`; nodes added if exceeded |
-| IOPS per replicated write | 0.245 | `--iops-per-replica-write` (TPC-C) |
-| Disk write amplification | 19× | `--disk-write-amp` (TPC-C) |
+| IOPS per replicated write | 0.245 | `--iops-per-replica-write` (benchmark-calibrated) |
+| Disk write amplification | 19× | `--disk-write-amp` (benchmark-calibrated) |
 | Read cache miss | computed: 1 − (½ RAM / leader data) | `--read-cache-miss` fixes it |
 | Network factors | 13.9× per replicated write, 3.2× per read (per row byte) | `--net-write-factor`, `--net-read-factor` |
 | Cross-AZ price | $0.02/GB | `--cross-az-cost-per-gb` (AWS $0.01 each direction) |

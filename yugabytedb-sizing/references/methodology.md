@@ -72,7 +72,7 @@ Base ratio      = 1:4 vCPU:RAM; read-heavy (Write% < 50) and leader data/node > 
                   1:4 node (half its RAM) → 1:8
 Base memory     = vCPU/node × ratio                       (total node RAM)
 PostgreSQL share = Base memory × 0.27                     (use_memory_defaults_optimized_for_ysql)
-Connection mem  = backends/node × 15 MB                   (TPC-C PSS per backend)
+Connection mem  = backends/node × 15 MB                   (PSS measured under OLTP load)
 Connection extra = max(0, Connection mem − PostgreSQL share)
 Memory/node     = Base + Connection extra + 200 MB odyssey (Connection Manager) + tablet RAM/node
                   → round up to RAM tier (16, 32, 64, 128, 192, 256, 384, 512 …),
@@ -93,9 +93,9 @@ Replicated writes/node = Write ops × RF / nodes
 IOPS/node           = Replicated writes × 0.245 + Reads/node × miss
 Disk MiB/s/node     = Replicated writes × row size × (1 + index overhead) × 19 / 1,048,576
 ```
-Calibrated against TPC-C (3,503 IOPS, 92.6 MiB/s per node; 94 GB leader data vs 32 GB cache) and
-sysbench (≈0 read IOPS with 8 GB leader data in a 16 GB cache). Uniform access is conservative:
-skewed workloads with a hot subset miss less.
+Calibrated against transactional and point-select benchmark runs; when leader data fits the cache,
+reads cause almost no disk I/O. Uniform access is conservative: skewed workloads with a hot subset
+miss less.
 
 **Disk limits** (`--disk-iops`, `--disk-mibps`; default 16,000 IOPS / 1,000 MiB/s = gp3 maximum):
 nodes are added until both fit. gp3 includes 3,000 IOPS / 125 MiB/s; anything above is
@@ -110,8 +110,8 @@ Cross GB/month   = Cross/node × nodes / 2 × seconds/month   (each transfer cou
 Cross cost       = GB/month × $0.02                       (inter-AZ $0.01 each way; inter-region ~$0.02)
 ```
 With `--regions`, each region is a zone and the cross traffic is inter-region.
-Factors calibrated against TPC-C (60.2 MiB/s/node) and sysbench (29.7 MiB/s/node), at the default
-512-byte row. Keep total traffic below ~40% of NIC capacity.
+Factors calibrated against transactional and point-select benchmark runs, at the default 512-byte
+row. Keep total traffic below ~40% of NIC capacity.
 
 ## Step 10: Storage growth
 ```

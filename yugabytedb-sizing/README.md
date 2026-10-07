@@ -10,11 +10,11 @@ Choosing the right cluster size for YugabyteDB requires balancing CPU, memory, s
 
 | Area | What's Computed |
 |---|---|
-| **CPU Sizing** | Measured CPU cost per read/write (YSQL from a TPC-C 4k run on YB 2026.1, YCQL from the key-value benchmark) × workload profile, plus connection and tablet CPU; iterative node count, target ≤65% utilization |
+| **CPU Sizing** | Measured CPU cost per read/write (YSQL from transactional and point-select benchmarks on YB 2026.1, YCQL from the public key-value benchmark) × workload profile, plus connection and tablet CPU; iterative node count, target ≤65% utilization |
 | **Storage** | LZ4 compression, RF replication, index overhead (20% YSQL / 10% YCQL), 20% compaction reserve, WAL from write rate × retention (longer with xCluster/CDC), 20 TB/node cap |
 | **Memory** | 1:4 vCPU:RAM, or 1:8 for read-heavy data that doesn't fit a 1:4 node's cache, as total node RAM; YSQL connections (15 MB each, from TPC-C) fit in PostgreSQL's 27% share before adding RAM; rounded to standard RAM tiers |
-| **IOPS / Disk** | IOPS per replicated write and disk MiB/s with LSM amplification (TPC-C calibrated); read IOPS from cache vs leader data (sysbench calibrated); nodes added to fit gp3 (or your NVMe/io2) limits |
-| **Network** | Separate read and replicated-write traffic factors (TPC-C + sysbench calibrated); multi-AZ cross-zone traffic and monthly transfer cost |
+| **IOPS / Disk** | IOPS per replicated write and disk MiB/s with LSM amplification; read IOPS from cache vs leader data (benchmark-calibrated); nodes added to fit gp3 (or your NVMe/io2) limits |
+| **Network** | Separate read and replicated-write traffic factors (benchmark-calibrated); multi-AZ cross-zone traffic and monthly transfer cost |
 | **Topology** | Multi-AZ by default (one zone per replica); single-AZ; multi-region with balanced or pinned (preferred-region) leaders, cross-region latency and transfer cost |
 | **Transactions** | TPS × statements per transaction; distributed-transaction overhead (commit + intents) on fast-path profiles; YSQL write pipelining for cross-region latency |
 | **Read offload** | Follower reads and a separately sized read-replica cluster |
@@ -128,7 +128,7 @@ Only observed QPS and CPU% are required; if the PoC shape isn't given, it's assu
 | RPC overhead | 15% | 8% | Retries and real-world variance on top of the measured costs |
 | Index storage | 20% | 10% | YCQL models are typically denormalized |
 | Connections/vCPU | 16 | not modeled | CQL drivers multiplex requests |
-| Memory/connection | 15 MB | — | Per PostgreSQL backend (TPC-C PSS); counted against PostgreSQL's 27% RAM share first |
+| Memory/connection | 15 MB | — | Per PostgreSQL backend (PSS under OLTP load); counted against PostgreSQL's 27% RAM share first |
 | Tablets | auto-split / 1 per table | auto-split / 1 per tserver per table | Data-driven count always; schema count when object count is given |
 | WAL retention | 15 min (24 h xCluster, 8 h CDC) | 15 min (24 h xCluster) | WAL = write MB/s × retention |
 | Connection Manager | off; when on: 10 backends/vCPU, ~10 clients/backend, +200 MB/node | n/a | `--connection-manager` |

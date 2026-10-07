@@ -21,7 +21,7 @@ Rules:
 - RF must be 1, 3, 5 or 7 (the script rejects others). Never recommend RF=1 for production.
 - **Always state that the sizing is indicative** and that the user should test with their actual
   workload to fine-tune production sizing.
-- CPU comes from measured CPU cost per operation (TPC-C, sysbench and YCQL benchmark runs), not
+- CPU comes from measured CPU cost per operation (transactional, point-select and YCQL key-value benchmarks), not
   from latency. Details: [references/cpu-model.md](references/cpu-model.md).
 
 ## Workflow
@@ -162,7 +162,7 @@ Lead with the recommendation (nodes × vCPU, RAM and storage per node), then:
   separately with `--xcluster`; for geo-partitioned data, size each region's partition separately.
 - **Transactions**: single-statement writes use the fast path; any `BEGIN … COMMIT` block with
   writes is a distributed transaction (`--statements-per-txn` > 1 assumes so). The `oltp` profile
-  already includes TPC-C's distributed-transaction cost, so the overhead is added only to the
+  already includes distributed-transaction cost, so the overhead is added only to the
   fast-path profiles (YSQL `kv`, YCQL `point`/`range`).
 - **Bursty workloads**: size for peak QPS; add headroom or plan for horizontal scaling.
 - **YCQL secondary indexes**: each index is a table (`--num-objects`) and requires
@@ -185,7 +185,3 @@ Lead with the recommendation (nodes × vCPU, RAM and storage per node), then:
 - [references/methodology.md](references/methodology.md) — step-by-step formulas for every output
 - [references/defaults.md](references/defaults.md) — every default and its flag
 - [references/examples.md](references/examples.md) — worked YSQL and YCQL examples
-
-Tests (for maintainers): `python3 -m unittest discover -s tests -v` from the skill directory.
-Golden files in `tests/golden/` pin reference scenarios and benchmark reproductions; after an
-intentional model change, run with `UPDATE_GOLDEN=1` and review `git diff tests/golden/`.

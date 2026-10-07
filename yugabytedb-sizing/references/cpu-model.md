@@ -14,22 +14,21 @@ RF scale       = (1 + (RF − 1) × 0.33) / (1 + 2 × 0.33)        (= 1.0 at RF=
 
 Costs are for current-generation CPUs (m7i/m8i/m8g class) at RF=3, before the RPC multiplier.
 
-## Measured sources
+## Sources
 
-| API | Run | Measured | Derived |
-|---|---|---|---|
-| YSQL `oltp` | TPC-C 4k warehouses, YB 2026.1, 3 × m8i.4xlarge (16 vCPU, 64 GB), single AZ, TLS, gp3, 400 connections | 14,985 stmt/s (56% writes) at 54.5% CPU | 1.070 ms/read, 1.784 ms/write |
-| YSQL `kv` | sysbench point selects, YB 2026.1, 3 × m6i.2xlarge (8 vCPU, 32 GB), single AZ, TLS, gp3, ~60 connections | 57,061 selects/s at 73.0% CPU | 0.229 ms/read current-gen (m6i ÷ 1.15) → multiplier 0.214 |
-| YCQL `point` | YCQL key-value benchmark, 3 × i3.4xlarge (2016-era Broadwell), older YB release | 150k reads/s and 90k writes/s, each at 60% CPU | measured 0.178 / 0.296 ms → 0.107 / 0.178 ms after the ×0.6 hardware-generation factor |
+| API | Calibration source | Derived |
+|---|---|---|
+| YSQL `oltp` | TPC-C-style transactional benchmark, YB 2026.1, current-generation x86, RF=3 | 1.070 ms/read, 1.784 ms/write |
+| YSQL `kv` | Point-select benchmark, YB 2026.1, RF=3 | multiplier 0.214 on the `oltp` cost |
+| YCQL `point` | Public YCQL key-value benchmark (YugabyteDB docs): 150k reads/s and 90k writes/s at 60% CPU on 3 × 16 cores (i3.4xlarge, older release) | measured 0.178 / 0.296 ms → 0.107 / 0.178 ms after the ×0.6 hardware-generation factor |
 
 Derivation: busy cores − connection CPU − tablet-maintenance CPU = workload cores, divided by the
-RPC multiplier and the operation rate. TPC-C can't separate read from write cost on its own, so
-the split uses YCQL's measured write:read ratio (1.67). Cross-check: YSQL point ops cost ≈ 2.1×
-YCQL point ops for both reads and writes.
+RPC multiplier and the operation rate. A transactional mix can't separate read from write cost on
+its own, so the YSQL split uses YCQL's measured write:read ratio (1.67). Cross-check: YSQL point
+ops cost ≈ 2.1× YCQL point ops for both reads and writes.
 
-The test suite reproduces these runs: TPC-C CPU (Intel 54.4% vs 54.5%, ARM 59.7% vs 60.2%),
-IOPS, disk, network and the 64 GB node; sysbench CPU, zero read IOPS, network and the 32 GB node;
-YCQL 60% with the hardware factor undone.
+The test suite checks the calibrated constants and reproduces the public YCQL key-value benchmark
+(60% CPU with the hardware factor undone).
 
 **YCQL hardware-generation factor (×0.6).** No current YCQL run is published. Per-vCPU throughput
 from Broadwell to current Xeon/Graviton (3–4 generations of IPC gains plus higher clocks) is
@@ -69,7 +68,7 @@ benchmark (ep. 107): 1.7 vs 4.7 ms and ~6,000 vs ~2,000 transactions in the same
 
 Any `BEGIN` block with writes is distributed, so `--distributed-txn-pct` defaults to 100 when
 statements per transaction > 1, and 0 for autocommit. The overhead is **added only to fast-path
-profiles** (YSQL `kv`, YCQL `point`/`range`): `oltp` was measured on TPC-C, whose transactions are
+profiles** (YSQL `kv`, YCQL `point`/`range`): `oltp` was measured on a TPC-C-style workload, whose transactions are
 distributed, so it — and `complex`/`analytics`, which scale from it — already include it, as does
 YCQL `lwt`. The 1.0 / 1.0 unit costs are estimates; calibrate when the user has a cluster.
 
@@ -113,7 +112,7 @@ Without inputs, `--workload htap` assumes 1 query/s × 1M rows and flags it.
 
 | Flag | Default | Use |
 |---|---|---|
-| `--cpu-arch arm` | x86 | Graviton used 10% more CPU than m8i for the same TPC-C load (×1.10) |
+| `--cpu-arch arm` | x86 | Graviton used ~10% more CPU than x86 for the same OLTP load (×1.10) |
 | `--cpu-cost-scale` | 1.0 | Older target hardware: ~1.15 previous gen (m6i/c6i/m6g), ~1.5 for m5/c5/i3 |
 | `--cpu-ms-per-read`, `--cpu-ms-per-write` | profile | The user's own measured costs |
 | `--rpc-overhead` | YSQL 0.15, YCQL 0.08 | Retries and real-world variance on top of the measured costs (costs were derived net of it) |
