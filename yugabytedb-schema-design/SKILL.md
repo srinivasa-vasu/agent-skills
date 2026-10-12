@@ -1,19 +1,17 @@
 ---
 name: yugabytedb-schema-design
 description: >
-  Best practices for designing high-performance YugabyteDB schemas from scratch, and for reviewing
-  existing ones live or offline. Covers hash vs range sharding decisions, avoiding write hotspots on
-  sequential columns, partial indexes for nullable or skewed columns, low-cardinality index design,
-  covering indexes, primary key selection, foreign key index requirements, and redundant index
-  cleanup. Includes a read-only collector and an offline analyzer that review a database from its
-  catalog, pg_stats, pg_stat_statements or tserver statements.json. Use this skill whenever the
-  user asks how to design a YugabyteDB schema, choose a sharding strategy, avoid hotspots, optimize
-  indexes, handle NULL-heavy columns, model a table for distributed SQL, or asks "how should I
-  structure this in YugabyteDB". Also use it to review, audit or health-check an existing YSQL
-  schema: find redundant or unused indexes, HASH-sharded timestamp columns, low-cardinality hash
-  keys, missing FK indexes, or to analyze a customer's schema dump, pg_stats export or
-  statements.json. Trigger even when the user mentions "YugabyteDB indexes", "YSQL schema",
-  "tablet hotspot", "sharding key", or asks why their YugabyteDB writes are slow or skewed.
+  Design and review high-performance YugabyteDB YSQL schemas. Covers hash vs range sharding,
+  write hotspots on sequential columns, partial indexes for nullable or skewed columns,
+  low-cardinality indexes, covering indexes, primary keys, foreign key indexes, and redundant
+  index cleanup. Includes read-only scripts and an offline analyzer that review an existing
+  database from its catalog, pg_stats, pg_stat_statements or statements.json. Use this skill
+  when the user asks how to design a YugabyteDB schema, choose a sharding key, avoid hotspots,
+  optimize indexes, or model tables for distributed SQL; or wants an existing YSQL database
+  reviewed or audited (redundant/unused indexes, HASH timestamp columns, low-cardinality hash
+  keys, missing FK indexes), live or from a schema dump, stats export or statements.json.
+  Trigger on "YugabyteDB indexes", "YSQL schema", "tablet hotspot", "sharding key", or slow or
+  skewed YugabyteDB writes.
 ---
 
 # YugabyteDB Schema Design Best Practices
