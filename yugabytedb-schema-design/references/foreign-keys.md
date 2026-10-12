@@ -50,8 +50,9 @@ CREATE INDEX idx_order_items_fk ON order_items(tenant_id, order_id);
 ## Rule 2: Match FK Column Data Types Exactly
 
 When the referencing column (child) and referenced column (parent) have **different but
-compatible** types (e.g., `INT` vs `BIGINT`), every FK check requires an implicit type cast.
-At scale, this degrades INSERT and UPDATE performance significantly.
+compatible** types (e.g., `INT` vs `BIGINT`), FK checks and joins compare across types. This adds
+avoidable overhead, can produce surprising plans for joins on those columns, and an `INT` child
+column will overflow once the `BIGINT` parent passes ~2.1B. Align the types.
 
 ```sql
 -- ❌ Type mismatch: child.parent_id is INT, parent.id is BIGINT
@@ -72,9 +73,12 @@ CREATE TABLE child (
 
 **Common mismatches to watch for**:
 - `INT` ↔ `BIGINT` (very common in migrated schemas)
-- `VARCHAR(n)` ↔ `TEXT`
-- `NUMERIC` ↔ `FLOAT`
 - `SERIAL` (resolves to `INT`) ↔ `BIGSERIAL` (resolves to `BIGINT`)
+- `NUMERIC` ↔ `FLOAT` — depending on direction, the FK either requires a cast on every check or
+  fails at DDL time ("foreign key constraint cannot be implemented"). Floating-point keys are a
+  correctness smell anyway; use `NUMERIC` or integers.
+- `VARCHAR(n)` ↔ `TEXT` is binary-compatible, so there's no cast cost. Align it for consistency
+  only (and to avoid a too-short `VARCHAR(n)` rejecting valid parent values).
 
 ---
 
@@ -116,6 +120,9 @@ CREATE TABLE order_items (
 - All `order_items` rows for a given `order_id` hash to the **same tablet** — reads and writes for one order's items are single-shard operations
 - `SELECT * FROM order_items WHERE order_id = ?` is served by **one tablet**, not scattered across many
 - Batch inserts for items of the same order go to a **single shard**, reducing cross-node coordination
+- The PK itself satisfies Rule 1: `order_id` is its leading column, so **no separate FK index is
+  needed** — a `CREATE INDEX ... ON order_items(order_id)` here would be redundant (see
+  [index-design.md](index-design.md#redundant-indexes))
 
 **Anti-pattern — sharding child by its own key:**
 

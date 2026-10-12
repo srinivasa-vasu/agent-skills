@@ -48,6 +48,15 @@ SELECT * FROM orders
 WHERE created_at >= NOW() - INTERVAL '1 month';
 ```
 
+This works because YugabyteDB can **skip scan** a range-sharded prefix: it seeks to each bucket
+value and applies the `created_at` condition inside each one. (Skip scan is not available on a
+partially specified HASH key, which is why A2 below needs the explicit `IN (...)` list.)
+
+> ⚠️ **Global ordering**: rows are sorted by `created_at` only *within* each bucket. For
+> `ORDER BY created_at DESC LIMIT n`, v2025.2.1+ can merge the buckets into a globally ordered
+> result without query changes; on older versions expect a Sort over all matching rows. Verify
+> with `EXPLAIN` for top-N / pagination queries.
+
 Choose N based on expected write throughput (see table below). Keep N at a minimum equal to
 the replication factor (typically 3). Physical shard boundaries cannot be changed manually
 after creation, but tablets will auto-split as data grows. Because data is physically
@@ -81,10 +90,10 @@ This approach uses a virtual hash-based logical shard key to distribute writes a
 
 | Condition | Use |
 |---|---|
-| Table PK is HASH sharded | **A2** ✅ |
-| Table PK is RANGE sharded | A1 |
-| Want queries without `IN (...)` shard filter | **A2** ✅ |
-| Need N > 9 logical shards | A1 |
+| Table PK is HASH sharded | **A1** ✅ |
+| Table PK is RANGE sharded | A2 |
+| Want queries without `IN (...)` shard filter | **A1** ✅ |
+| Need a large N (> ~12) | A2 |
 
 ### Option B: Add a `shard_id` Column (Primary Keys / Unique Constraints)
 
@@ -101,7 +110,7 @@ CREATE TABLE event_log (
 -- ✅ Add shard_id column that randomly assigns a bucket
 CREATE TABLE event_log (
     event_type TEXT,
-    shard_id INT DEFAULT (floor(random() * 100)::int % 16),
+    shard_id INT DEFAULT floor(random() * 16)::int,   -- uniform over 0..15
     event_logged_at TIMESTAMP,
     PRIMARY KEY (shard_id HASH, event_logged_at DESC)
 );
@@ -111,6 +120,13 @@ SELECT * FROM event_log
 WHERE shard_id IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
   AND event_logged_at >= NOW() - INTERVAL '1 month';
 ```
+
+> ⚠️ Generate the bucket directly as `floor(random() * N)`. A pattern like
+> `floor(random() * 100)::int % 16` is **not uniform** (buckets 0–3 get 7% of rows, 4–15 get 6%).
+>
+> `shard_id` has only N distinct hash values, so at most N tablets ever receive data for this
+> table. This is an intentional low-cardinality hash key — choose N ≥ the tablet count you expect
+> the table to grow to.
 
 ---
 
@@ -148,6 +164,14 @@ CREATE TABLE users (
 **Note**: UUID PKs with HASH sharding distribute extremely evenly and are the recommended
 pattern for high-write tables where you don't need range scans on the PK.
 
+**Sequence notes**:
+- Prefer `BIGINT GENERATED ... AS IDENTITY` / `BIGSERIAL` over `SERIAL` (`INT`, overflows at ~2.1B).
+- YSQL caches sequence values per connection (`ysql_sequence_cache_minval`, default 100; a lower
+  `CACHE` clause is overridden). Values are therefore **not ordered across connections and have
+  gaps** — never use them for ordering or gap-free numbering.
+- Every cache refill goes to the single tablet holding the sequence. With very high connection
+  churn or multi-region apps, raise `CACHE` or use UUIDs.
+
 ---
 
 ## Pattern 3: Colocated Tables — Hotspots Don't Apply
@@ -155,6 +179,10 @@ pattern for high-write tables where you don't need range scans on the PK.
 If your table is **colocated**, all data lives on a single tablet by design. Hotspot
 prevention is irrelevant — but so is horizontal scalability for that table. Use colocated
 tables for small reference/lookup tables only. Colocation should be enabled at database or cluster level in order to colocate tables. Table definition needs to be suffixed with `WITH (COLOCATION = true|false)`. `WITH (COLOCATION = true)` is the default in a colocated database. To exclude a table from colocation, use `WITH (COLOCATION = false)` explicitly. It's recommended to explicitly specify `WITH (COLOCATION = true|false)` for tables.
+
+Colocated tables and their indexes are **range-sharded by default** (`num_hash_key_columns = 0`
+in `yb_table_properties()`), so a plain `PRIMARY KEY (id)` is `ASC`. If a table is later moved
+out of colocation, re-check its keys for monotonic range hotspots.
 
 ---
 

@@ -33,6 +33,10 @@ CREATE INDEX idx_order_status ON orders(customer_id HASH, status ASC);
 -- Queries: WHERE customer_id = ? AND status = 'active' → efficient
 ```
 
+Only valid if the queries actually filter on `customer_id`. This changes the access path: a
+query with only `WHERE status = 'active'` cannot use this index (no skip scan on a HASH
+column). If `status` alone is the filter, use Option 2 or a range-sharded index instead.
+
 ### Option 2: Use a partial index for each value
 
 If each value has clearly distinct query patterns, create a partial index per value:
@@ -59,9 +63,56 @@ CREATE INDEX idx_order_status_id ON orders(status, order_id);
 CREATE INDEX idx_order_id_status ON orders(order_id HASH, status ASC);
 
 -- ✅ Option 2: Force RANGE sharding on the combined value
-CREATE INDEX idx_order_status_id ON orders(status ASC, order_id ASC);
--- Range sharding distributes based on combined sorted value during tablet splits, so even if status has low cardinality, the order_id component allows for good distribution across tablets. Works well if the primary key of the table is hash sharded.
+CREATE INDEX idx_order_status_id ON orders(status ASC, order_id ASC)
+SPLIT AT VALUES (('cancelled'), ('pending'), ('shipped'));   -- 4 values → 3 split points → 4 tablets
+-- Range sharding splits on the full key, which includes the base-table row key suffix, so even a
+-- low-cardinality status distributes across tablets. Works well if the table's PK is HASH sharded
+-- (see "the hidden PK suffix" below).
 ```
+
+### Why range sharding works here: the hidden PK suffix
+
+A non-unique secondary index entry is physically keyed on **(indexed columns…, base-table row
+key)**. YugabyteDB appends the table's row key (`ybctid`) to the declared index columns. Range
+splits are computed on this **entire** key, suffix included.
+
+When the table's PK is **HASH-sharded**, its row key starts with the 16-bit hash code. Within a
+single `status` value, index entries are therefore ordered by hash, i.e. effectively at random:
+
+```sql
+-- orders PK: (order_id HASH)
+CREATE INDEX idx_order_status ON orders(status ASC)
+SPLIT AT VALUES (('cancelled'), ('pending'), ('shipped'));
+-- physical key: (status, hash(order_id), order_id)
+-- new 'pending' rows land at random positions inside the 'pending' range → after splits,
+-- writes for even a single dominant value spread across many tablets
+```
+
+This is why "works well if the PK is hash sharded" keeps appearing in this skill. Adding the
+PK column explicitly (`(status ASC, order_id ASC)`) is not needed for distribution. Add it only
+if queries filter or sort on it.
+
+**What breaks the suffix trick** — anything that makes the key *before* the suffix monotonic,
+or the suffix itself monotonic:
+
+| Index / table | Where new entries land within one `status` value | Result |
+|---|---|---|
+| `(status ASC)`, PK `HASH` | random (hash suffix) | ✅ spreads after splits |
+| `(status ASC)`, PK `ASC` on a sequence/timestamp | tail (monotonic suffix) | ❌ one hot tail per value |
+| `(status ASC, created_at ASC)`, any PK | tail (`created_at` precedes the suffix) | ❌ one hot tail per value |
+| `UNIQUE (status, …)` | the row key is not part of a unique index's key | suffix trick doesn't apply |
+
+With a hot tail per value you get at most K write hot spots for K distinct values. That's fine
+when new rows spread evenly across values and K ≥ node count; it's a hotspot when most new rows
+share one value (e.g. every new order is `'pending'`). Fixes: drop the monotonic column from the
+key if nothing sorts or filters on it (and rely on a HASH PK suffix), or add a bucket prefix
+(Option A1 in [hotspots.md](hotspots.md)).
+
+**Pre-split range indexes.** A new range-sharded index starts as **one tablet**. The suffix only
+helps after auto-splitting kicks in. Split points can be a prefix of the key, so splitting on
+the known low-cardinality values (every value except the smallest, sorted in the column's order —
+for an ENUM, its declared order) gives one tablet per value from day one. Later splits happen on
+the full key (suffix included), so a large value range keeps splitting further.
 
 ---
 
@@ -78,8 +129,9 @@ CREATE INDEX idx_status ON orders(status);
 -- ✅ Reorder: hash on high-cardinality customer_id
 CREATE INDEX idx_status ON orders(customer_id HASH, status);
 
--- ✅ Or range-shard the composite
-CREATE INDEX idx_status ON orders(status ASC, order_id ASC);
+-- ✅ Or range-shard the composite (pre-split on the enum values, in declared enum order)
+CREATE INDEX idx_status ON orders(status ASC, order_id ASC)
+SPLIT AT VALUES (('active'), ('shipped'), ('delivered'), ('cancelled'));
 ```
 
 ### Boolean Column
@@ -92,9 +144,15 @@ CREATE INDEX idx_active ON users(is_active);
 CREATE INDEX idx_active_users ON users(created_at DESC) WHERE is_active = true;
 -- Only active users indexed; sorted by recency for common "recent active users" queries. Also follow the hotspot prevention patterns if necessary.
 
--- ✅ Or combine with a high-cardinality column
+-- ❌ Don't "fix" it by prefixing the PK column:
 CREATE INDEX idx_active ON users(user_id HASH, is_active);
+-- WHERE is_active = true can't use it (no skip scan on HASH), and WHERE user_id = ?
+-- is already served by the PK → a redundant index that only adds write cost.
 ```
+
+If the boolean is queried for a large fraction of rows (e.g. 50% active), no index on it helps;
+a sequential scan with the filter pushed down to storage is usually faster. Index it only
+together with the columns the query actually filters or sorts on.
 
 ### Day-of-Week / Hour-of-Day
 

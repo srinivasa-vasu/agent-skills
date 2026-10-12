@@ -73,6 +73,35 @@ CREATE INDEX idx_orders_created ON orders(created_at ASC);
 In **Enhanced PostgreSQL Compatibility mode**, the default sharding strategy changes from HASH to RANGE. Check whether your cluster has this enabled before
 deciding whether to explicitly specify `ASC`/`DESC`.
 
+The underlying setting is `yb_use_hash_splitting_by_default` (`on` = HASH default, `off` = RANGE
+default). With it `off`, a plain `PRIMARY KEY (id)` on a sequence/identity becomes `id ASC`, which
+is a monotonic write hotspot.
+
+```sql
+SHOW yb_use_hash_splitting_by_default;
+
+-- How keys were actually created: pg_get_indexdef() always spells out HASH / ASC / DESC
+SELECT indexrelid::regclass, pg_get_indexdef(indexrelid)
+FROM pg_index WHERE indrelid = 'orders'::regclass;
+
+-- num_hash_key_columns = 0 → range-sharded (pass the TABLE oid for the PK, the index oid for secondary indexes)
+SELECT * FROM yb_table_properties('orders'::regclass);
+```
+
+**Best practice**: always write `HASH` or `ASC`/`DESC` explicitly in DDL so the schema behaves
+the same regardless of cluster defaults.
+
+To audit a whole database, `scripts/checks/hash_on_range_type.sql` lists HASH key columns of
+date/time types, including PKs. Don't use `yb_table_properties()` for this: it returns NULL for PK
+indexes. Read the HASH bit from `pg_index.indoption` instead. For a full review, see
+[review-mode.md](review-mode.md).
+
+## Colocated Tables
+
+Tables and indexes in a colocated database (or tablegroup) are **range-sharded by default**, since
+all of them share a single tablet. HASH doesn't apply there. A table moved out of colocation keeps
+its range keys, so re-check them for monotonic hotspots (see [hotspots.md](hotspots.md)).
+
 ## Composite Sharding Keys
 
 For tables with multiple access patterns, use a composite key:

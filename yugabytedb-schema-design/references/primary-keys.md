@@ -53,6 +53,11 @@ CREATE TABLE users (
 );
 ```
 
+**Caveat: only use a business key as the PK if it is immutable.** Updating a PK value is
+physically a delete plus insert of the row (possibly moving it to another tablet), rewrites every
+secondary index entry, and must cascade to all referencing FK columns. Emails, usernames and phone
+numbers change; prefer a surrogate PK plus a `UNIQUE` index for those.
+
 ### Rule 3: Don't Range-Shard a Monotonically Increasing PK
 
 ```sql
@@ -108,11 +113,12 @@ CREATE TABLE sensor_readings (
 
 ## Partitioned Tables: PK Must Be Defined in CREATE TABLE
 
-For partitioned tables, you **cannot** add a PK with `ALTER TABLE` after creation (fixed in
-v2024.1+, but best practice is always to define it inline):
+For partitioned tables, adding a PK with `ALTER TABLE` after creation has historically been
+unsupported, and where it is supported it rewrites every partition. Always define it inline. As in
+PostgreSQL, the PK must include all partition key columns.
 
 ```sql
--- ❌ May fail on older versions
+-- ❌ May fail (version-dependent), and rewrites every partition where supported
 CREATE TABLE sales (id INT, region TEXT NOT NULL) PARTITION BY LIST (region);
 ALTER TABLE sales ADD CONSTRAINT sales_pkey PRIMARY KEY (id, region);
 
@@ -152,3 +158,9 @@ CREATE TABLE users (
     CONSTRAINT users_email_unique UNIQUE (email)
 );
 ```
+
+**On an existing table**, `ALTER TABLE ... ADD PRIMARY KEY` is a **full table rewrite** of the
+table and all its indexes. Concurrent DML during the rewrite is not safe (it may not be reflected
+in the new copy), and dependent views may be dropped and need recreating. Schedule it as a
+maintenance operation, combine it with any other rewriting `ALTER`s into one statement, and for
+large tables consider creating a new table and copying the data instead.

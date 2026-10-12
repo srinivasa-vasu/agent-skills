@@ -17,6 +17,7 @@ YugabyteDB is an index-organized, distributed SQL database. Schema decisions tha
 | **Low-Cardinality Columns** | [`low-cardinality.md`](references/low-cardinality.md) | Handling boolean, ENUM, and low-distinct-value sharding keys |
 | **Primary Keys** | [`primary-keys.md`](references/primary-keys.md) | PK selection, explicit PKs, composite PKs for partitioned tables |
 | **Foreign Keys** | [`foreign-keys.md`](references/foreign-keys.md) | FK type alignment and mandatory FK indexes |
+| **Review Mode** | [`review-mode.md`](references/review-mode.md) | Reviewing an existing database live or offline: bundle, scripts, triage, rollout |
 
 ## When to Use
 
@@ -28,19 +29,41 @@ This skill activates when a user:
 - Asks how to **optimize indexes** or handle NULL-heavy columns
 - Mentions keywords like *"YSQL schema"*, *"tablet hotspot"*, *"sharding key"*
 - Reports that their **YugabyteDB writes are slow or skewed**
+- Wants an existing database **reviewed or audited**, live or from a schema dump, pg_stats export or `statements.json`
+
+## Review Mode
+
+Review an existing database with read-only scripts and an offline analyzer:
+
+```bash
+# live: collect a bundle (schema dump, catalog + pg_stats, per-node usage and pg_stat_statements)
+scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle
+
+# offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
+python3 scripts/analyze.py bundle      # -> bundle/review/report.md, findings.json, proposed.sql
+```
+
+Checks include HASH-sharded date/time key columns, redundant and unused indexes, low-cardinality,
+NULL-heavy or skewed HASH keys, monotonic range keys, per-value write tails, single-tablet range
+indexes, partial-index pitfalls, missing or mistyped FK indexes, tables without a PK, and
+scan-heavy statements. Each finding carries an evidence level (schema / stats / workload). The
+analyzer never runs DDL: changes are written to `proposed.sql` for review. See
+[`review-mode.md`](references/review-mode.md) for the customer-side commands, schema-only replay,
+the accepted statements formats, and the rollout runbook.
 
 ## Golden Rules
 
 ### Do
 
-- ✅ Always define an explicit `PRIMARY KEY`
-- ✅ Use `ASC`/`DESC` on index columns that are range-queried
-- ✅ Put high-cardinality columns first in multi-column indexes
-- ✅ Index every foreign key column in child tables
-- ✅ Use partial indexes for nullable or skewed columns
+- ✅ Always define an explicit `PRIMARY KEY` (inline in `CREATE TABLE`; `ADD PRIMARY KEY` rewrites the table)
+- ✅ Write `HASH` / `ASC` / `DESC` explicitly — the default depends on `yb_use_hash_splitting_by_default`
+- ✅ Use `ASC`/`DESC` on index columns that are range-queried (pre-split new range indexes)
+- ✅ Order index columns Equality → Sort → Range; a `HASH` leading column must be high-cardinality
+- ✅ Index every foreign key column in child tables (a PK whose leading column is the FK counts)
+- ✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate
 - ✅ Match FK column types exactly (`INT` vs `BIGINT` matters)
-- ✅ Drop redundant indexes (prefix-covered by another index)
-- ✅ Use `TEXT` datatype wherever possible instead of `VARCHAR(n)`
+- ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
+- ✅ Use `TEXT` wherever possible instead of `VARCHAR(n)` (no performance benefit; use a `CHECK` constraint if a limit is needed)
 
 ### Don't
 
@@ -48,19 +71,29 @@ This skill activates when a user:
 - ❌ Never range-shard on a monotonically increasing column without a synthetic shard key
 - ❌ Never leave tables without a PK if `UNIQUE NOT NULL` columns exist
 - ❌ Never create multi-column GIN indexes
+- ❌ Never rely on partial indexes for queries that bind the predicate value as a parameter
 
 ## Project Structure
 
 ```
 yugabytedb-schema-design/
 ├── SKILL.md              # Skill definition and quick-decision guide
-├── README.md             # 
-└── references/
-    ├── sharding.md       # Hash vs range sharding strategies
-    ├── hotspots.md       # Write/read hotspot prevention
-    ├── index-design.md   # Index column ordering and covering indexes
-    ├── partial-indexes.md# Partial indexes for sparse data
-    ├── low-cardinality.md# Low-cardinality column indexing
-    ├── primary-keys.md   # Primary key selection patterns
-    └── foreign-keys.md   # Foreign key design and performance
+├── README.md
+├── references/
+│   ├── sharding.md        # Hash vs range sharding strategies
+│   ├── hotspots.md        # Write/read hotspot prevention
+│   ├── index-design.md    # Index column ordering, covering and redundant indexes
+│   ├── partial-indexes.md # Partial indexes for sparse data
+│   ├── low-cardinality.md # Low-cardinality column indexing
+│   ├── primary-keys.md    # Primary key selection patterns
+│   ├── foreign-keys.md    # Foreign key design and performance
+│   └── review-mode.md     # Reviewing an existing database (live or offline)
+└── scripts/
+    ├── collect.sh         # Read-only bundle collector
+    ├── export-stats.sql   # Catalog + pg_stats -> stats.json
+    ├── export-usage.sql   # Per-node usage + pg_stat_statements -> usage/<node>.json
+    ├── analyze.py         # Offline analyzer -> report.md, findings.json, proposed.sql
+    └── checks/
+        ├── hash_on_range_type.sql  # HASH key columns of date/time types
+        └── redundant_indexes.sql   # Redundant (overshadowed) indexes
 ```
