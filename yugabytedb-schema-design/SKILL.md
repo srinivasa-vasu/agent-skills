@@ -88,7 +88,7 @@ Read only the section(s) relevant to the user's question:
 ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
 ✅ Use TEXT wherever possible instead of VARCHAR(n) (no performance benefit; use a CHECK constraint if a limit is needed)
 
-❌ Never use a low-cardinality column as the sole sharding key
+❌ Never use a low-cardinality column (boolean, enum, smallint code) as the only HASH column
 ❌ Never range-shard on a monotonically increasing column without a synthetic shard key
 ❌ Never leave tables without a PK if UNIQUE NOT NULL columns exist
 ❌ Never create multi-column GIN indexes

@@ -47,6 +47,8 @@ TIME_TYPES = {
     "time without time zone", "time with time zone",
 }
 INT_TYPES = {"smallint", "integer", "bigint"}
+# leading HASH key types flagged as possibly low-cardinality when no statistics exist
+SUSPECT_LOWCARD_TYPES = {"smallint", '"char"'}
 TIME_DEFAULT_RE = re.compile(
     r"\b(now|clock_timestamp|statement_timestamp|transaction_timestamp)\s*\(|"
     r"\bCURRENT_(TIMESTAMP|DATE)\b|\bLOCALTIMESTAMP\b", re.I)
@@ -724,6 +726,28 @@ def rule_lowcard_hash(m, F):
                 break
             est *= nd
             srcs.add(src)
+        k0 = i["keys"][0]
+        if est is None and i["hash_count"] == 1 and k0["base_type"] in SUSPECT_LOWCARD_TYPES:
+            # no stats for the column: a HASH-led smallint is usually a status/priority/type code
+            pk = t["pk"]
+            keys = ", ".join(key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"])
+            F.add("low-cardinality-hash", "low", "schema", i["fq"],
+                  f"HASH-led {k0['base_type']} key: possible low cardinality",
+                  f"{i['name']} on {t['fq']} hashes on `{k0['expr']}` ({k0['base_type']}), with no statistics "
+                  "to tell how many distinct values it holds. Code/status/priority columns typically have a "
+                  "handful: each value's rows then sit on one tablet that can't split.",
+                  "Check the distinct count (ANALYZE, then pg_stats.n_distinct). If it is small, range-shard "
+                  f"it ({k0['expr']} ASC) with SPLIT AT VALUES on the known values"
+                  + (" — the HASH primary key suffix spreads entries within each value." if pk and pk["hash_count"]
+                     else " plus an A1 bucket, since the PK is not HASH."),
+                  REF["lowcard"], confidence="low",
+                  actions=[] if i["is_pk"] or i["is_unique"] else
+                  [manual(replace_index(i, keys)[0]["sql"],
+                          note=f"if {k0['expr']} turns out low-cardinality: range-shard it and add "
+                               "SPLIT AT VALUES on its values, then swap it in")],
+                  confirm=[f"How many distinct values does {t['fq']}.{k0['expr']} hold?"],
+                  data={"definition": i["definition"]})
+            continue
         if est is None or est > LOWCARD_MAX:
             continue
         ev = "stats" if "stats" in srcs else "schema"
@@ -740,7 +764,14 @@ def rule_lowcard_hash(m, F):
             vals = m.split_values(t, i["keys"][0])
             pk = t["pk"]
             pk_hash = bool(pk and pk["hash_count"])
-            range_keys = ", ".join(key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"])
+            range_cols = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"]]
+            mono_next = len(i["keys"]) > 1 and m.monotonic(t, i["keys"][1])[0]
+            if mono_next:
+                # (lowcard ASC, ts ASC) would give one write tail per value: bucket the monotonic column
+                k1 = i["keys"][1]
+                k1e = k1["expr"] if k1["attnum"] else f"({k1['expr']})"
+                range_cols.insert(1, f"(yb_hash_code({k1e}) % {m.buckets}) ASC")
+            range_keys = ", ".join(range_cols)
             split = split_clause([ql(v) for v in vals]) if vals and i["hash_count"] == 1 else ""
             rec = (f"All rows with one {hk} value share a hash code, so they sit on one tablet that can't split "
                    f"(at most {int(est)} tablets ever). Options: (1) lead with a high-cardinality HASH column the "
@@ -750,8 +781,11 @@ def rule_lowcard_hash(m, F):
             rec += " (3) A partial index if only some values are queried."
             if i["is_unique"]:
                 actions = [manual(f"-- unique index {i['name']}: reshape by hand, keeping the same uniqueness rule")]
-            elif pk_hash:
-                actions = replace_index(i, range_keys, split, note="range-sharded; HASH PK suffix spreads each value")
+            elif pk_hash or mono_next:
+                actions = replace_index(i, range_keys, split,
+                                        note=f"range-sharded; A1 bucket on {i['keys'][1]['expr']} (N={m.buckets}) "
+                                             "spreads each value's new rows" if mono_next else
+                                             "range-sharded; HASH PK suffix spreads each value")
             else:
                 actions = replace_index(i, bucket_keys(m, i, i["keys"][0]), bucket_split(m.buckets),
                                         note=f"range PK suffix: A1 bucket prefix, N={m.buckets}")

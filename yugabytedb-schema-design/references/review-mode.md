@@ -203,7 +203,7 @@ re-review, a second run was a no-op, and `rollback.sql` restored the exact origi
 | `invalid-index` | schema | [index-design.md](index-design.md) |
 | `hash-on-range-type` | schema → workload when range filters/ORDER BY on the column are seen | [hotspots.md](hotspots.md), [sharding.md](sharding.md) |
 | `monotonic-range-key` | schema (identity, sequence, `now()` default, or timestamp-like name) | [hotspots.md](hotspots.md) |
-| `low-cardinality-hash` | stats (n_distinct) or schema (boolean/enum) | [low-cardinality.md](low-cardinality.md) |
+| `low-cardinality-hash` | stats (n_distinct ≤ 64) or schema (boolean/enum); a HASH-led `smallint` without stats is a low-confidence candidate. Replacement: `(col ASC)` + `SPLIT AT VALUES`, with an A1 bucket on a following monotonic column | [low-cardinality.md](low-cardinality.md) |
 | `null-heavy-hash`, `skewed-hash` | stats (null_frac, MCV freq) | [partial-indexes.md](partial-indexes.md) |
 | `range-hot-tails` | schema/stats: low-cardinality range column followed by a monotonic key or range PK suffix | [low-cardinality.md](low-cardinality.md) |
 | `range-single-tablet` | stats: range-sharded, 1 tablet, ≥ 100k rows | [low-cardinality.md](low-cardinality.md) |

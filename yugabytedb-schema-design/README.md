@@ -74,7 +74,7 @@ the accepted statements formats, and the rollout runbook.
 
 ### Don't
 
-- ❌ Never use a low-cardinality column as the sole sharding key
+- ❌ Never use a low-cardinality column (boolean, enum, smallint code) as the only `HASH` column
 - ❌ Never range-shard on a monotonically increasing column without a synthetic shard key
 - ❌ Never leave tables without a PK if `UNIQUE NOT NULL` columns exist
 - ❌ Never create multi-column GIN indexes

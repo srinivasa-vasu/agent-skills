@@ -14,6 +14,9 @@ This creates both a distribution problem (uneven data) and a scalability ceiling
 - `BOOLEAN` (true/false)
 - `ENUM` types with few values (status, category, day-of-week)
 - Columns with only a handful of distinct values (region codes, priority levels)
+- `SMALLINT` / `"char"` code columns (priority, type or state codes): the type allows many values,
+  but these usually hold a handful. Confirm with `pg_stats.n_distinct` (after `ANALYZE`); the
+  review analyzer flags a HASH-led `smallint` as a candidate when no statistics exist
 
 ---
 
@@ -105,8 +108,10 @@ or the suffix itself monotonic:
 With a hot tail per value you get at most K write hot spots for K distinct values. That's fine
 when new rows spread evenly across values and K ≥ node count; it's a hotspot when most new rows
 share one value (e.g. every new order is `'pending'`). Fixes: drop the monotonic column from the
-key if nothing sorts or filters on it (and rely on a HASH PK suffix), or add a bucket prefix
-(Option A1 in [hotspots.md](hotspots.md)).
+key if nothing sorts or filters on it (and rely on a HASH PK suffix), or bucket the monotonic
+column **inside** each value: `(status ASC, (yb_hash_code(created_at) % N) ASC, created_at ASC)`
+([A1 inside a low-cardinality value](hotspots.md#a1-inside-a-low-cardinality-value)). Equality on
+`status` still seeks, and each value's new rows spread across N buckets.
 
 **Pre-split range indexes.** A new range-sharded index starts as **one tablet**. The suffix only
 helps after auto-splitting kicks in. Split points can be a prefix of the key, so splitting on
@@ -143,6 +148,11 @@ CREATE INDEX idx_active ON users(is_active);
 -- ✅ Use a partial index instead (usually the right answer for booleans)
 CREATE INDEX idx_active_users ON users(created_at DESC) WHERE is_active = true;
 -- Only active users indexed; sorted by recency for common "recent active users" queries. Also follow the hotspot prevention patterns if necessary.
+
+-- ✅ If both values are queried: range-shard and pre-split on the boolean
+CREATE INDEX idx_active ON users(is_active ASC) SPLIT AT VALUES (('true'));
+-- false < true: one tablet per value from day one; a HASH PK suffix spreads each value further.
+-- With a monotonic column after it, bucket it: (is_active ASC, (yb_hash_code(created_at) % 3) ASC, created_at ASC)
 
 -- ❌ Don't "fix" it by prefixing the PK column:
 CREATE INDEX idx_active ON users(user_id HASH, is_active);

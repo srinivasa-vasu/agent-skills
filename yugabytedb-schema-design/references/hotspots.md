@@ -57,10 +57,38 @@ partially specified HASH key, which is why A2 below needs the explicit `IN (...)
 > result without query changes; on older versions expect a Sort over all matching rows. Verify
 > with `EXPLAIN` for top-N / pagination queries.
 
+### A1 inside a low-cardinality value
+
+When a low-cardinality column leads the index and a monotonic column follows it, every value gets
+its own write tail (`(status ASC, created_at ASC)`: new rows append at the end of each status
+range). Put the bucket **after** the low-cardinality column, so equality on it still seeks and
+each value's new rows spread across N buckets:
+
+```sql
+-- ❌ one write tail per status value
+CREATE INDEX idx_orders_status_created ON orders(status ASC, created_at ASC);
+
+-- ✅ bucket inside each status value
+CREATE INDEX idx_orders_status_created ON orders(
+    status ASC,
+    (yb_hash_code(created_at) % 3) ASC,
+    created_at ASC
+) SPLIT AT VALUES (('cancelled'), ('pending'), ('shipped'));   -- split on the status values
+
+-- WHERE status = 'pending' AND created_at > ... seeks to the status, then skip-scans the 3 buckets
+```
+
+The same applies to booleans and small code columns (`(is_done ASC, (yb_hash_code(created_at) % N) ASC, created_at ASC)`).
+See [low-cardinality.md](low-cardinality.md#why-range-sharding-works-here-the-hidden-pk-suffix).
+
+### Choosing N
+
 Choose N based on expected write throughput (see table below). Keep N at a minimum equal to
-the replication factor (typically 3). Physical shard boundaries cannot be changed manually
-after creation, but tablets will auto-split as data grows. Because data is physically
-distributed across N shards, distribution is more even. Prefer this option if the table's primary key is already HASH sharded.
+the replication factor (typically 3). The review analyzer (`scripts/analyze.py`) generates N =
+number of nodes, clamped to 3–12; adjust it in `findings.json` before rendering `changes.sql`.
+Physical shard boundaries cannot be changed manually after creation, but tablets will auto-split
+as data grows. Because the split points sit exactly on the bucket boundaries, each bucket gets
+its own tablet: the spread is even by construction, whatever the table's primary key is.
 
 
 ### Option A2: Add a Synthetic Hash Shard Key (Secondary Indexes)
@@ -80,24 +108,41 @@ WHERE yb_hash_code(created_at) % 16 IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
   AND created_at >= NOW() - INTERVAL '1 month';
 ```
 
-This approach uses a virtual hash-based logical shard key to distribute writes across N physical shards. Queries must include the shard key filter (all N values in an `IN (...)` clause) to fan out across all shards. As data is logically distributed across N shards, physical distribution may be slightly uneven. Prefer this option if the table's primary key is already RANGE sharded.
+This approach uses a virtual hash-based logical shard key to distribute writes across N shards.
+Queries must include the shard key filter (all N values in an `IN (...)` clause) to fan out
+across all shards.
+
+The spread is **not guaranteed to be even**. Each bucket value is hashed again into the 0–65535
+hash space, and N hashed points don't land evenly across the tablets' equal hash ranges: some
+tablets get two or three buckets, others none. Every row of a bucket shares one hash code, so a
+heavy bucket can never split. Uneven placement is most pronounced at small N.
 
 ---
 
 ### A1 vs A2 Decision Rule
 
-**If the table's primary key is already HASH sharded → always prefer A1 over A2.**
+**Default to A1, whatever the table's primary key is.**
 
-| Condition | Use |
-|---|---|
-| Table PK is HASH sharded | **A1** ✅ |
-| Table PK is RANGE sharded | A2 |
-| Want queries without `IN (...)` shard filter | **A1** ✅ |
-| Need a large N (> ~12) | A2 |
+| | A1 (range bucket + `SPLIT AT VALUES`) | A2 (HASH bucket) |
+|---|---|---|
+| Write spread | Even: one pre-split tablet per bucket | Depends on where the N bucket hashes fall; can be uneven |
+| Bucket growth | Each bucket keeps auto-splitting | A bucket is one hash code: never splits |
+| Range queries | No `IN (...)` filter (skip scan over buckets) | Must list all N buckets in `IN (...)` |
+| Large N (> ~12) | Many split points to declare | ✅ the reason to pick A2 |
+
+The table's primary key type doesn't change this. In both patterns the indexed timestamp comes
+**before** the primary-key suffix in the index key, so `(bucket, created_at)` decides where a new
+entry lands, not the suffix. The suffix only matters for indexes with nothing monotonic ahead of
+it, like `(status ASC)` (see [low-cardinality.md](low-cardinality.md#why-range-sharding-works-here-the-hidden-pk-suffix)).
+
+> ⚠️ If the **table's own** primary key is a monotonic range key (sequence, identity, timestamp
+> `ASC`), the table itself is the write hotspot. Neither A1 nor A2 fixes that: they only fix the
+> index. Change the primary key (HASH it, or Option B below).
 
 ### Option B: Add a `shard_id` Column (Primary Keys / Unique Constraints)
 
-When the timestamp is part of the PK or a unique key, add a physical `shard_id` column:
+When the timestamp is part of the PK or a unique key, add a physical `shard_id` column. A1/A2
+don't work there: a PRIMARY KEY can't contain an expression like `yb_hash_code(col) % N`.
 
 ```sql
 -- ❌ WRONG: monotonic PK → all inserts to one tablet
