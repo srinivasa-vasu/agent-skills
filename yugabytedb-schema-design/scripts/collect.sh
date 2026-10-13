@@ -3,6 +3,8 @@
 #
 #   collect.sh -h <host> -d <db> [-U user] [-p 5433] [-o bundle_dir]
 #              [--nodes h1,h2,h3] [--values-mode lowcard|none|all] [--no-dump] [--endpoint]
+#              [--sslrootcert root.crt] [--sslmode verify-full|verify-ca|require]
+#              [--sslcert client.crt --sslkey client.key] [--web-https]
 #
 # Produces:
 #   bundle/schema.sql        ysql_dump --schema-only --include-yb-metadata   (skip with --no-dump)
@@ -11,13 +13,18 @@
 #   bundle/statements/<node>.json  tserver :13000/statements          (only with --endpoint)
 #
 # Nodes default to yb_servers(); pass --nodes when those addresses aren't reachable from here.
-# Password/TLS: use the usual libpq env vars (PGPASSWORD, PGSSLMODE, PGSSLROOTCERT, ...).
+# TLS: --sslrootcert sets the CA used to verify the server (sslmode defaults to verify-ca when a
+#   root cert is given: it checks the chain but not the hostname, which suits IP-addressed nodes;
+#   use --sslmode verify-full when node names match the certificate). --sslcert/--sslkey add a
+#   client certificate. libpq env vars (PGSSLMODE, PGSSLROOTCERT, ...) are honored too.
+# Password: PGPASSWORD or a ~/.pgpass entry (one per node avoids repeated prompts).
 # Use a read-only role; the scripts also set default_transaction_read_only.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HOST="" DB="yugabyte" USER_="${PGUSER:-yugabyte}" PORT="5433" OUT="bundle-$(date +%Y%m%d-%H%M%S)"
 NODES="" VALUES_MODE="lowcard" DUMP=1 ENDPOINT=0 WEB_PORT=13000
+SSLMODE="${PGSSLMODE:-}" SSLROOTCERT="${PGSSLROOTCERT:-}" SSLCERT="${PGSSLCERT:-}" SSLKEY="${PGSSLKEY:-}" WEB_HTTPS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,19 +38,43 @@ while [[ $# -gt 0 ]]; do
     --no-dump) DUMP=0; shift ;;
     --endpoint) ENDPOINT=1; shift ;;
     --web-port) WEB_PORT="$2"; shift 2 ;;
+    --sslmode) SSLMODE="$2"; shift 2 ;;
+    --sslrootcert) SSLROOTCERT="$2"; shift 2 ;;
+    --sslcert) SSLCERT="$2"; shift 2 ;;
+    --sslkey) SSLKEY="$2"; shift 2 ;;
+    --web-https) WEB_HTTPS=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
-[[ -n "$HOST" ]] || { sed -n '2,17p' "$0"; exit 2; }
+[[ -n "$HOST" ]] || { sed -n '2,21p' "$0"; exit 2; }
 
 YSQLSH="${YSQLSH:-$(command -v ysqlsh || command -v psql || true)}"
 YSQL_DUMP="${YSQL_DUMP:-$(command -v ysql_dump || true)}"
 [[ -n "$YSQLSH" ]] || { echo "ysqlsh/psql not found; set YSQLSH=/path/to/ysqlsh" >&2; exit 1; }
 
+# TLS settings travel as libpq env vars, so ysqlsh and ysql_dump both pick them up
+for f in "$SSLROOTCERT" "$SSLCERT" "$SSLKEY"; do
+  [[ -z "$f" || -r "$f" ]] || { echo "cannot read certificate/key file: $f" >&2; exit 1; }
+done
+if [[ -n "$SSLROOTCERT" ]]; then
+  SSLMODE="${SSLMODE:-verify-ca}"
+  export PGSSLROOTCERT="$SSLROOTCERT"
+fi
+[[ -n "$SSLMODE" ]] && export PGSSLMODE="$SSLMODE"
+[[ -n "$SSLCERT" ]] && export PGSSLCERT="$SSLCERT"
+[[ -n "$SSLKEY" ]] && export PGSSLKEY="$SSLKEY"
+CURL_TLS=()
+WEB_SCHEME=http
+if [[ $WEB_HTTPS -eq 1 ]]; then
+  WEB_SCHEME=https
+  [[ -n "$SSLROOTCERT" ]] && CURL_TLS=(--cacert "$SSLROOTCERT")
+fi
+
 sql() { "$YSQLSH" -X -q -v ON_ERROR_STOP=1 -h "$1" -p "$PORT" -U "$USER_" -d "$DB" "${@:2}"; }
 
 mkdir -p "$OUT/usage"
 echo "bundle: $OUT"
+[[ -n "$SSLMODE" ]] && echo "tls: sslmode=$SSLMODE${SSLROOTCERT:+ sslrootcert=$SSLROOTCERT}${SSLCERT:+ client cert}"
 
 if [[ $DUMP -eq 1 ]]; then
   if [[ -n "$YSQL_DUMP" ]]; then
@@ -73,8 +104,8 @@ for n in "${NODE_LIST[@]}"; do
   fi
   if [[ $ENDPOINT -eq 1 ]]; then
     mkdir -p "$OUT/statements"
-    curl -sf --max-time 30 "http://$n:$WEB_PORT/statements" -o "$OUT/statements/$n.json" \
-      || echo "  ! $n:$WEB_PORT/statements not reachable" >&2
+    curl -sf --max-time 30 ${CURL_TLS[@]+"${CURL_TLS[@]}"} "$WEB_SCHEME://$n:$WEB_PORT/statements" \
+      -o "$OUT/statements/$n.json" || echo "  ! $WEB_SCHEME://$n:$WEB_PORT/statements not reachable" >&2
   fi
 done
 

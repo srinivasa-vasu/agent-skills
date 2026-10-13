@@ -6,8 +6,10 @@ same analyzer, so findings are identical and repeatable.
 
 ```
 live:     collect.sh ──┐
-offline:  customer ────┴──> bundle/ ──> analyze.py ──> findings.json + report.md + proposed.sql
-                                                         └──> you triage, explain, ask, prioritize
+offline:  customer ────┴──> bundle/ ──> analyze.py ──> findings.json ──> render.py ──> report.md
+                                                          ▲                          changes.sql
+                                                          └── you triage ────────────  rollback.sql
+                                                              (status, review_note, edited SQL)
 ```
 
 ---
@@ -17,7 +19,7 @@ offline:  customer ────┴──> bundle/ ──> analyze.py ──> fin
 - Connect with a **read-only role**. The export scripts also set `default_transaction_read_only`
   and a `statement_timeout`.
 - **Never execute DDL** (CREATE/DROP/ALTER INDEX, ALTER TABLE). Recommendations go to
-  `proposed.sql` for the customer to run after review.
+  `changes.sql` (with `rollback.sql`) for the customer to run after review.
 - **Never run `ANALYZE` without asking.** It's a write and can be heavy on big tables.
 - **No `EXPLAIN ANALYZE` on production without consent.** It executes the query. Plain `EXPLAIN` is fine.
 - Export scripts never read table rows. `pg_stats` sample values are limited (see `values_mode`);
@@ -52,7 +54,17 @@ scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle
 #   --nodes h1,h2,h3     when yb_servers() addresses aren't reachable from here
 #   --values-mode none   export no pg_stats sample values at all
 #   --endpoint           also fetch http://<node>:13000/statements
+#   --sslrootcert ca.crt TLS: verify the server against this CA (sslmode defaults to verify-ca)
+#   --sslmode verify-full  when node host names match the certificate
+#   --sslcert/--sslkey   client certificate authentication
+#   --web-https          fetch :13000/statements over https (uses --sslrootcert as the CA)
 ```
+
+For TLS-enabled clusters (yugabyted `--secure`, YBA "encryption in transit"), pass the cluster's
+root CA, e.g. `--sslrootcert <base_dir>/certs/ca.crt` for yugabyted. The same settings are
+exported as `PGSSLMODE` / `PGSSLROOTCERT` / `PGSSLCERT` / `PGSSLKEY`, so `ysql_dump` and every
+`ysqlsh` call use them. Hand-run commands take the same env vars or a connection string:
+`ysqlsh "host=<h> dbname=<db> sslmode=verify-ca sslrootcert=ca.crt" -f export-stats.sql ...`
 
 Or by hand (what to send a customer):
 
@@ -115,7 +127,7 @@ Use the same YugabyteDB major version as the source.
 ## Running the Analyzer
 
 ```bash
-python3 scripts/analyze.py bundle            # writes bundle/review/{report.md,findings.json,proposed.sql}
+python3 scripts/analyze.py bundle            # writes bundle/review/{findings.json,report.md,changes.sql,rollback.sql}
 python3 scripts/analyze.py bundle --out out/
 ```
 
@@ -143,11 +155,45 @@ The analyzer is deterministic. Your value is judgment. With `report.md` / `findi
    For example, a range-converted index must still serve the existing equality lookups, and the
    reorder in low-cardinality Option 1 only helps if queries filter on the new leading column.
 5. **Collect the questions** (the report lists them) and ask the customer instead of guessing.
-6. **Edit `proposed.sql`** into a reviewed change script. Keep the "create, verify, then drop"
-   order. Add `SPLIT AT VALUES` where the values are known. Warn on anything that rewrites a table
-   (PK changes, `ADD PRIMARY KEY`).
+6. **Record your triage in `findings.json`, then re-render** so the SQL matches the report:
+   - `"status": "rejected"` + `"review_note": "why"` for false positives or changes the customer
+     declines. Rejected findings move to a "Rejected in review" section and leave `changes.sql`.
+   - `"status": "accepted"` for confirmed ones (`render.py --accepted-only` emits only these).
+   - Edit an action's `"sql"` (and its `"rollback"`) to adjust a change: bucket count, INCLUDE
+     columns, split points. To turn a manual item into a real change, set its `"phase"`.
+   - Then: `python3 scripts/render.py bundle/review/findings.json`.
+   Never hand-edit `changes.sql` alone: the next render overwrites it, and it drifts from the report.
 7. **Write the customer report**: summary, top 3–5 changes with impact and risk, the questions,
-   the rollout plan below.
+   the rollout plan below. `report.md` already lists each finding's changes and their phase.
+
+### The generated SQL
+
+`changes.sql` holds every change in the (triaged) report, grouped into phases, and runs **one
+phase per invocation**. Without `-v phase=...` it does nothing:
+
+```bash
+ysqlsh -d <db> -v phase=prepare -f changes.sql   # ANALYZE tables without statistics
+ysqlsh -d <db> -v phase=create  -f changes.sql   # FK indexes, replacement indexes (built online)
+#   ... verify plans and latency ...
+ysqlsh -d <db> -v phase=drop    -f changes.sql   # drop redundant indexes; swap replacements in
+ysqlsh -d <db> -v phase=rewrite -f changes.sql   # PK / column-type changes: full table rewrites,
+                                                 # maintenance window, writes stopped (#19860)
+```
+
+- **Replacements keep the original name.** A replacement index is built as `<name>_new` in
+  `create`. In `drop`, the old index is dropped and the new one renamed, so hints and dashboards
+  keep working. The swap only runs while `<name>_new` exists, so re-running a phase is safe.
+- **Overlaps are resolved.** A replacement of an index that is dropped as redundant is skipped. An
+  index that covers a dropped one is flagged if another finding changes or drops it.
+- **Manual decisions** (choices, unique-index reshapes, unused-index drops, range-tail options,
+  templates with `<placeholders>`) are written commented out at the end.
+- `rollback.sql` undoes the phases in reverse (`rewrite` → `drop` → `create`). Recreated indexes
+  come from `pg_get_indexdef`, which omits `SPLIT AT` clauses: re-add them from `schema.sql`.
+- All statements are idempotent (`IF [NOT] EXISTS`). YSQL has no `DROP INDEX CONCURRENTLY`; plain
+  `CREATE INDEX` already builds online outside a transaction block.
+
+Tested end to end: applying every phase on a test schema cleared all non-manual findings on
+re-review, a second run was a no-op, and `rollback.sql` restored the exact original schema.
 
 ### Rule catalog
 
@@ -197,17 +243,15 @@ Offline review produces hypotheses, not proven fixes.
 2. **Validate on staging** with representative data. For each change, compare plans for the
    affected top statements with `EXPLAIN (ANALYZE, DIST)`: rows scanned, read requests, sort
    removed. For hotspot fixes, run a write load and confirm writes spread across tablet leaders.
-3. **Roll out in order of risk:**
-   1. **Create** new or replacement indexes. `CREATE INDEX` builds online by default in YSQL
-      (outside a transaction block); schedule large builds off-peak.
+3. **Roll out in order of risk** (these are the `changes.sql` phases):
+   1. **prepare / create**: new and replacement indexes. `CREATE INDEX` builds online by default
+      in YSQL (outside a transaction block); schedule large builds off-peak.
    2. **Verify** production plans pick them up.
-   3. **Drop** redundant/unused indexes one at a time, only after a full business cycle shows no
-      use on any node. Keep the recreate statement. YSQL has no `DROP INDEX CONCURRENTLY` and no
-      multi-object `DROP INDEX a, b`: issue one plain `DROP INDEX` per index.
-   4. **Re-shard indexes** (HASH → range, bucket prefixes) by creating the new index alongside the
-      old one, verifying, then dropping the old one. Never alter in place.
-   5. **PK or table-sharding changes** are full table rewrites. Do them last, in a maintenance
-      window or as a migration to a new table.
+   3. **drop**: redundant indexes, plus swapping each replacement in for the index it replaces.
+      Unused-index drops stay manual until a full business cycle on every node shows no use.
+      YSQL has no `DROP INDEX CONCURRENTLY` and no multi-object `DROP INDEX a, b`.
+   4. **rewrite**: PK and column-type changes are full table rewrites. Do them last, in a
+      maintenance window with writes stopped, or as a migration to a new table.
 4. **Re-measure.** Run `SELECT pg_stat_statements_reset()` on every node after the rollout, let a
    representative window pass, collect a new bundle and re-run the analyzer. Compare the two
    reports to see what improved and catch regressions.

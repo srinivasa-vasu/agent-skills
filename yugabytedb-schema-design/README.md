@@ -37,17 +37,24 @@ Review an existing database with read-only scripts and an offline analyzer:
 
 ```bash
 # live: collect a bundle (schema dump, catalog + pg_stats, per-node usage and pg_stat_statements)
-scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle
+scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle [--sslrootcert ca.crt]
 
 # offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
-python3 scripts/analyze.py bundle      # -> bundle/review/report.md, findings.json, proposed.sql
+python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.md, changes.sql, rollback.sql
+
+# after triage (status / review_note / edited SQL in findings.json): re-render report + SQL
+python3 scripts/render.py bundle/review/findings.json
+
+# apply one phase at a time
+ysqlsh -d <db> -v phase=create -f bundle/review/changes.sql   # prepare | create | drop | rewrite
 ```
 
 Checks include HASH-sharded date/time key columns, redundant and unused indexes, low-cardinality,
 NULL-heavy or skewed HASH keys, monotonic range keys, per-value write tails, single-tablet range
 indexes, partial-index pitfalls, missing or mistyped FK indexes, tables without a PK, and
 scan-heavy statements. Each finding carries an evidence level (schema / stats / workload). The
-analyzer never runs DDL: changes are written to `proposed.sql` for review. See
+analyzer never runs DDL. Every change in the report is written to `changes.sql` (phased:
+prepare → create → drop → rewrite, idempotent) with a matching `rollback.sql`. See
 [`review-mode.md`](references/review-mode.md) for the customer-side commands, schema-only replay,
 the accepted statements formats, and the rollout runbook.
 
@@ -92,7 +99,8 @@ yugabytedb-schema-design/
     ├── collect.sh         # Read-only bundle collector
     ├── export-stats.sql   # Catalog + pg_stats -> stats.json
     ├── export-usage.sql   # Per-node usage + pg_stat_statements -> usage/<node>.json
-    ├── analyze.py         # Offline analyzer -> report.md, findings.json, proposed.sql
+    ├── analyze.py         # Offline analyzer -> findings.json (+ render)
+    ├── render.py          # findings.json -> report.md, changes.sql, rollback.sql
     └── checks/
         ├── hash_on_range_type.sql  # HASH key columns of date/time types
         └── redundant_indexes.sql   # Redundant (overshadowed) indexes

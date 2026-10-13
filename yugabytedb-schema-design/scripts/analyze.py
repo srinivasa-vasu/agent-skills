@@ -2,7 +2,8 @@
 """
 Offline YugabyteDB schema review.
 
-Reads a review bundle and writes findings.json, report.md and proposed.sql.
+Reads a review bundle and writes findings.json, report.md, changes.sql and rollback.sql
+(the last three via render.py, which re-renders them after triage).
 Never connects to a database and never executes DDL. Python 3.8+, stdlib only.
 
     python3 analyze.py BUNDLE_DIR [--out OUT_DIR]
@@ -233,6 +234,8 @@ class Model:
         self.statements = bundle.statements
         self.usage = bundle.usage
         self.node_count = self.meta.get("node_count") or 0
+        # A1 bucket count for generated DDL: one per node, between 3 and 12 (see hotspots.md)
+        self.buckets = min(12, max(3, self.node_count or 3))
         self.cbo_on = (self.meta.get("settings") or {}).get("yb_enable_cbo") == "on" or \
             (self.meta.get("settings") or {}).get("yb_enable_base_scans_cost_model") == "on"
 
@@ -352,12 +355,14 @@ class Findings:
         self.items = []
 
     def add(self, rule, severity, evidence, obj, title, detail, recommendation,
-            reference, ddl=None, confidence="high", confirm=None, data=None):
+            reference, actions=None, confidence="high", confirm=None, data=None):
         self.items.append({
             "rule": rule, "severity": severity, "evidence": evidence, "confidence": confidence,
             "object": obj, "title": title, "detail": detail, "recommendation": recommendation,
-            "reference": reference, "suggested_ddl": ddl, "needs_confirmation": confirm or [],
+            "reference": reference, "actions": actions or [], "needs_confirmation": confirm or [],
             "data": data or {},
+            # set by the reviewer, then re-render: proposed | accepted | rejected
+            "status": "proposed", "review_note": "",
         })
 
     def sorted(self):
@@ -390,6 +395,98 @@ def stmt_ref(stmts, n=3):
              "query": s["query"][:300]} for s in stmts[:n]]
 
 
+# ---- actions: the DDL behind each finding, rendered into changes.sql / rollback.sql by render.py
+#
+# phase    prepare (ANALYZE) | create (new indexes, online) | drop (drops, swap replacements in)
+#          | rewrite (table rewrites: PK / column type) | manual (written commented out)
+# kind     create | drop | replace | alter | analyze | note
+# target   object the action creates/drops; `replaces` ties both halves of an index replacement
+#          to the original index so render.py can skip them when that index is dropped anyway
+
+def act(phase, sql, kind, target=None, rollback=None, replaces=None, note=None):
+    return {"phase": phase, "kind": kind, "sql": sql.rstrip(), "rollback": rollback,
+            "target": target, "replaces": replaces, "note": note}
+
+
+def tname(t):
+    return f"{qi(t['schema'])}.{qi(t['name'])}"
+
+
+def iname(i):
+    return f"{qi(i['table']['schema'])}.{qi(i['name'])}"
+
+
+def recreate_sql(i):
+    """Original index DDL, made idempotent. pg_get_indexdef omits SPLIT clauses, and prints
+    partitioned parent indexes as ON ONLY, which would not cascade to the partitions."""
+    sql = re.sub(r"^CREATE (UNIQUE )?INDEX ", lambda mm: f"CREATE {mm.group(1) or ''}INDEX IF NOT EXISTS ",
+                 i["definition"])
+    return re.sub(r" ON ONLY ", " ON ", sql, count=1) + ";"
+
+
+def index_tail(i):
+    inc = f" INCLUDE ({', '.join(c['expr'] for c in i['include'])})" if i["include"] else ""
+    pred = f" WHERE {i['predicate']}" if i["predicate"] else ""
+    return inc + pred
+
+
+def split_clause(values):
+    return f" SPLIT AT VALUES ({', '.join('(' + v + ')' for v in values)})" if values else ""
+
+
+def bucket_split(n):
+    return split_clause([str(b) for b in range(1, n)])
+
+
+def key_sql(k, opt=None):
+    expr = k["expr"] if k["attnum"] else f"({k['expr']})"
+    return f"{expr} {opt or k['opt']}"
+
+
+def swap_sql(i, tmp):
+    """Drop the old index and rename the replacement, only while the replacement still exists,
+    so re-running the phase never drops the (already renamed) new index."""
+    t = i["table"]
+    new = f"{qi(t['schema'])}.{qi(tmp)}"
+    return (f"SELECT to_regclass({ql(new)}) IS NOT NULL AS swap_ready \\gset\n"
+            f"\\if :swap_ready\n"
+            f"DROP INDEX IF EXISTS {iname(i)};\n"
+            f"ALTER INDEX {new} RENAME TO {qi(i['name'])};\n"
+            f"\\else\n"
+            f"\\echo 'skip: {tmp} not found (already swapped, or the create phase has not run)'\n"
+            f"\\endif")
+
+
+def replace_index(i, keys, split="", note=None):
+    """Build a replacement next to the old index, then drop the old one and take over its name
+    (hints and monitoring keep working)."""
+    t = i["table"]
+    tmp = (i["name"][:59] + "_new")
+    create = f"CREATE INDEX IF NOT EXISTS {qi(tmp)} ON {tname(t)} ({keys}){index_tail(i)}{split};"
+    swap = swap_sql(i, tmp)
+    return [act("create", create, "create", target=f"{t['schema']}.{tmp}", replaces=i["fq"],
+                rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(tmp)};", note=note),
+            act("drop", swap, "replace", target=i["fq"], replaces=i["fq"],
+                rollback=f"DROP INDEX IF EXISTS {iname(i)};\n{recreate_sql(i)}")]
+
+
+def bucket_keys(m, i, k, desc=False):
+    """A1 pattern: (yb_hash_code(col) % N) ASC, col, <rest of the key>."""
+    expr = k["expr"] if k["attnum"] else f"({k['expr']})"
+    rest = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"] if c is not k]
+    col = f"{expr} {'DESC' if desc else ('ASC' if k['opt'] == 'HASH' else k['opt'])}"
+    return ", ".join([f"(yb_hash_code({expr}) % {m.buckets}) ASC", col] + rest)
+
+
+def pk_alter(t, i, keys):
+    con = i["backs_constraint"] or f"{t['name']}_pkey"
+    return f"ALTER TABLE {tname(t)} DROP CONSTRAINT {qi(con)}, ADD CONSTRAINT {qi(con)} PRIMARY KEY ({keys});"
+
+
+def manual(sql, note=None, target=None, kind="note"):
+    return act("manual", sql, kind, target=target, note=note)
+
+
 # ---- rules -----------------------------------------------------------------
 
 def rule_no_pk(m, F):
@@ -400,11 +497,35 @@ def rule_no_pk(m, F):
                 and all(c["attnum"] and t["cols_by_num"][c["attnum"]]["not_null"] for c in i["keys"])]
         rec = "Define an explicit PRIMARY KEY. Without one, rows are keyed on a hidden ybrowid " \
               "(HASH) and every secondary-index lookup needs an extra hop."
+        pk_name = qi(f"{t['name']}_pkey")
         if uniq:
-            rec += f" Candidate: UNIQUE NOT NULL index {uniq[0]['name']} ({key_text(uniq[0])})."
+            u = uniq[0]
+            rec += f" Candidate: UNIQUE NOT NULL index {u['name']} ({key_text(u)})."
+            keys = ", ".join(key_sql(c) for c in u["keys"])
+            actions = [
+                act("rewrite", f"ALTER TABLE {tname(t)} ADD CONSTRAINT {pk_name} PRIMARY KEY ({keys});", "alter",
+                    target=t["fq"], rollback=f"ALTER TABLE {tname(t)} DROP CONSTRAINT {pk_name};"),
+                manual(f"DROP INDEX IF EXISTS {iname(u)};",
+                       note=f"{u['name']} duplicates the new primary key once it exists"),
+            ]
+        else:
+            actions = [manual(f"ALTER TABLE {tname(t)} ADD CONSTRAINT {pk_name} PRIMARY KEY (<column> HASH);",
+                              note="choose the key column(s); they must be NOT NULL and unique")]
         rec += " ALTER TABLE ... ADD PRIMARY KEY rewrites the table: plan a maintenance window or migrate to a new table."
         F.add("no-primary-key", "high", "schema", t["fq"], "Table has no primary key",
-              f"{t['fq']} is stored on the hidden ybrowid.", rec, REF["pk"])
+              f"{t['fq']} is stored on the hidden ybrowid.", rec, REF["pk"], actions=actions)
+
+
+def pk_reshape(t, i, k):
+    """Optional PK change for a HASH time column: other PK columns become the HASH part.
+    Expressions (bucket prefixes) are not allowed in a PRIMARY KEY."""
+    others = [c for c in i["keys"] if c is not k]
+    if not others:
+        return manual(f"-- {i['name']} is keyed only on {k['expr']}: a range PK on it would be a write "
+                      "hotspot and a PK can't hold a bucket expression; keep it and use the secondary index above")
+    hk = others[0]["expr"] + " HASH" if len(others) == 1 else f"({', '.join(c['expr'] for c in others)}) HASH"
+    return manual(pk_alter(t, i, f"{hk}, {key_sql(k, 'DESC')}"),
+                  note="optional: reshape the PK itself (full table rewrite); same columns, so same uniqueness")
 
 
 def rule_hash_on_range_type(m, F):
@@ -420,17 +541,41 @@ def rule_hash_on_range_type(m, F):
             sev, ev = ("high", "workload") if used else ("medium", "schema")
             what = "primary key" if i["is_pk"] else "index"
             mono, _ = m.monotonic(t, k)
+            others = [c for c in i["keys"][:i["hash_count"]] if c is not k]
             rec = (f"A HASH column only serves equality: range filters / ORDER BY on {k['expr']} cannot seek. "
                    f"Make it a range column ({k['expr']} ASC/DESC)")
-            if pos > 1 or i["hash_count"] > 1:
+            if others:
                 rec += ", keeping the high-cardinality equality columns as HASH and moving the time column to the range part"
-            if mono or pos == 1:
+            else:
                 rec += ". A leading range time column is a write hotspot: add a bucket prefix (pattern A1)"
             rec += ". Keep HASH only if every query is an exact-match lookup."
+            if others:
+                hk = others[0]["expr"] + " HASH" if len(others) == 1 else \
+                    f"({', '.join(c['expr'] for c in others)}) HASH"
+                rest = [key_sql(c) for c in i["keys"][i["hash_count"]:]]
+                keys = ", ".join([hk, key_sql(k, "DESC")] + rest)
+                split = ""
+            else:
+                keys, split = bucket_keys(m, i, k, desc=True), bucket_split(m.buckets)
+            if i["is_pk"]:
+                # keep the PK (changing it rewrites the table); add a range-capable index for the scans
+                new = f"{t['name']}_{(col['name'] if col else 'expr')}_range"[:63]
+                actions = [act("create", f"CREATE INDEX IF NOT EXISTS {qi(new)} ON {tname(t)} "
+                               f"({bucket_keys(m, i, k, desc=True) if not others else keys}){'' if others else split};",
+                               "create", target=f"{t['schema']}.{new}",
+                               rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(new)};",
+                               note="secondary index for range scans; the PK itself is unchanged"),
+                           pk_reshape(t, i, k)]
+            elif i["is_unique"]:
+                actions = [manual(f"CREATE UNIQUE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
+                                  f"({keys}){index_tail(i)}{split};",
+                                  note="unique index: verify the new key enforces the same rule, then swap")]
+            else:
+                actions = replace_index(i, keys, split)
             F.add("hash-on-range-type", sev, ev, i["fq"],
                   f"HASH-sharded {k['base_type']} column in {what}",
                   f"{what.capitalize()} {i['name']} on {t['fq']}: key position {pos} `{k['expr']}` is HASH.",
-                  rec, REF["hotspots"], confidence="high" if used else "medium",
+                  rec, REF["hotspots"], actions=actions, confidence="high" if used else "medium",
                   confirm=[] if used else [f"Are there range filters or ORDER BY on {t['fq']}.{k['expr']}?"],
                   data={"definition": i["definition"], "range_statements": stmt_ref(used)})
 
@@ -512,8 +657,10 @@ def rule_redundant(m, F):
                   + (f" Notes: {'; '.join(notes)}." if notes else ""),
                   "Drop it after confirming nothing depends on it. Every index adds a write per row change.",
                   REF["index"] + "#redundant-indexes",
-                  ddl=f"DROP INDEX {qi(t['schema'])}.{qi(r['name'])};  -- recreate: {r['definition']};",
-                  confirm=confirm, data={"redundant": r["definition"], "covered_by": e["definition"]})
+                  actions=[act("drop", f"DROP INDEX IF EXISTS {iname(r)};", "drop", target=r["fq"],
+                               rollback=recreate_sql(r), note=f"covered by {e['name']}")],
+                  confirm=confirm, data={"redundant": r["definition"], "covered_by": e["definition"],
+                                         "covered_by_index": e["fq"]})
 
 
 def rule_monotonic_range(m, F):
@@ -538,11 +685,27 @@ def rule_monotonic_range(m, F):
                f"SPLIT AT VALUES (pattern A1); or lead with a high-cardinality HASH column.")
         if i["is_pk"]:
             rec += " Changing a PK rewrites the table."
+            keys = ", ".join([key_sql(k0, "HASH")] + [key_sql(c) for c in i["keys"][1:]])
+            if t["relkind"] == "p":
+                actions = [manual(pk_alter(t, i, keys), note="partitioned table: change the PK per partition "
+                                  "or migrate; the PK must keep the partition key columns")]
+            else:
+                actions = [act("rewrite", pk_alter(t, i, keys), "alter", target=t["fq"],
+                               rollback=pk_alter(t, i, ", ".join(key_sql(c) for c in i["keys"])),
+                               note="HASH the PK; range scans / ORDER BY on the key lose their index order")]
+        elif i["is_unique"]:
+            actions = [manual(f"CREATE UNIQUE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
+                              f"({bucket_keys(m, i, k0)}){index_tail(i)}{bucket_split(m.buckets)};",
+                              note="unique index: verify, then swap it in by hand")]
+        else:
+            actions = replace_index(i, bucket_keys(m, i, k0), bucket_split(m.buckets),
+                                    note=f"A1 bucket prefix, N={m.buckets}")
         F.add("monotonic-range-key", sev, "schema", i["fq"],
               f"{what} leads with a monotonic range column",
               f"{i['name']} on {t['fq']} is range-sharded on `{k0['expr']} {k0['opt']}` ({reason}).",
-              rec, REF["hotspots"], confidence=conf,
-              confirm=[] if conf == "high" else [f"Is {t['fq']}.{k0['expr']} set to the current time on insert?"],
+              rec, REF["hotspots"], actions=actions, confidence=conf,
+              confirm=([] if conf == "high" else [f"Is {t['fq']}.{k0['expr']} set to the current time on insert?"])
+              + ([f"Do queries range-scan or ORDER BY {t['fq']}.{k0['expr']}?"] if i["is_pk"] else []),
               data={"definition": i["definition"]})
 
 
@@ -567,33 +730,36 @@ def rule_lowcard_hash(m, F):
         rows = m.rows(t)
         sev = "high" if est <= LOWCARD_SEVERE and (rows is None or rows >= PRESPLIT_ROWS) else "medium"
         hk = ", ".join(c["expr"] for c in i["keys"][:i["hash_count"]])
+        actions = []
         if i["is_pk"]:
             rec = "Lead the PK with a high-cardinality HASH column; keep the low-cardinality column in the range part."
+            actions = [manual(pk_alter(t, i, "<high-cardinality column> HASH, " +
+                                       ", ".join(key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"])),
+                              note="pick the leading HASH column (full table rewrite)")]
         else:
             vals = m.split_values(t, i["keys"][0])
             pk = t["pk"]
             pk_hash = bool(pk and pk["hash_count"])
-            rest = [c for c in i["keys"][1:]] if i["hash_count"] == 1 else []
-            rest_txt = "".join(f", {c['expr']} ASC" for c in rest)
-            split = f"\n  SPLIT AT VALUES ({', '.join('(' + ql(v) + ')' for v in vals)})" if vals and i["hash_count"] == 1 else ""
+            range_keys = ", ".join(key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"])
+            split = split_clause([ql(v) for v in vals]) if vals and i["hash_count"] == 1 else ""
             rec = (f"All rows with one {hk} value share a hash code, so they sit on one tablet that can't split "
                    f"(at most {int(est)} tablets ever). Options: (1) lead with a high-cardinality HASH column the "
                    f"queries filter on; (2) range-shard it ({hk} ASC) and pre-split")
             rec += (" — the HASH primary key suffix spreads entries within each value." if pk_hash else
                     " — but this table's PK is not HASH, so each value gets a write tail; add a bucket (pattern A1).")
             rec += " (3) A partial index if only some values are queried."
-            ddl = None
-            if i["hash_count"] == 1 and not i["is_unique"]:
-                inc = f" INCLUDE ({', '.join(c['expr'] for c in i['include'])})" if i["include"] else ""
-                pred = f" WHERE {i['predicate']}" if i["predicate"] else ""
-                ddl = (f"CREATE INDEX {qi(i['name'] + '_range')} ON {qi(t['schema'])}.{qi(t['name'])} "
-                       f"({i['keys'][0]['expr']} ASC{rest_txt}){inc}{pred}{split};\n"
-                       f"-- verify plans, then: DROP INDEX {qi(t['schema'])}.{qi(i['name'])};")
+            if i["is_unique"]:
+                actions = [manual(f"-- unique index {i['name']}: reshape by hand, keeping the same uniqueness rule")]
+            elif pk_hash:
+                actions = replace_index(i, range_keys, split, note="range-sharded; HASH PK suffix spreads each value")
+            else:
+                actions = replace_index(i, bucket_keys(m, i, i["keys"][0]), bucket_split(m.buckets),
+                                        note=f"range PK suffix: A1 bucket prefix, N={m.buckets}")
         F.add("low-cardinality-hash", sev, ev, i["fq"],
               "HASH sharding on a low-cardinality key",
               f"{i['name']} on {t['fq']} hashes on ({hk}): ~{int(est)} distinct values"
               + (f", {int(rows):,} rows" if rows else "") + ".",
-              rec, REF["lowcard"], ddl=None if i["is_pk"] else ddl,
+              rec, REF["lowcard"], actions=actions,
               confidence="high" if ev == "stats" else "medium",
               confirm=[f"Which queries use {i['name']}, and do they also filter on a high-cardinality column?"],
               data={"definition": i["definition"], "distinct_estimate": est})
@@ -620,22 +786,38 @@ def rule_skew_or_nulls(m, F):
         mentions = re.search(r"\b%s\b" % re.escape(col["name"]), pred)
         nf = s.get("null_frac") or 0
         top = (s.get("most_common_freqs") or [0])[0] or 0
+        pk = t["pk"]
+        pk_hash = bool(pk and pk["hash_count"])
         if nf >= NULL_HEAVY and not mentions:
+            t_pred = f"({pred}) AND " if pred else ""
+            keys = ", ".join(key_sql(c) for c in i["keys"])
+            tmp = i["name"][:59] + "_new"
+            create = (f"CREATE INDEX IF NOT EXISTS {qi(tmp)} ON {tname(t)} ({keys})"
+                      + (f" INCLUDE ({', '.join(c['expr'] for c in i['include'])})" if i["include"] else "")
+                      + f" WHERE {t_pred}{qi(col['name'])} IS NOT NULL;")
+            actions = [act("create", create, "create", target=f"{t['schema']}.{tmp}", replaces=i["fq"],
+                           rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(tmp)};",
+                           note="IS NULL lookups will no longer use this index"),
+                       act("drop", swap_sql(i, tmp), "replace", target=i["fq"], replaces=i["fq"],
+                           rollback=f"DROP INDEX IF EXISTS {iname(i)};\n{recreate_sql(i)}")]
             F.add("null-heavy-hash", "medium", "stats", i["fq"], "NULL-heavy HASH index column",
                   f"{nf:.0%} of {t['fq']}.{col['name']} is NULL; all NULL entries of {i['name']} hash to one tablet.",
                   f"If NULLs are never looked up: add WHERE {col['name']} IS NOT NULL. If they are, range-shard "
                   f"({col['name']} ASC); a HASH PK suffix spreads the NULL range after splits.",
-                  REF["partial"],
-                  ddl=f"CREATE INDEX {qi(i['name'] + '_nn')} ON {qi(t['schema'])}.{qi(t['name'])} "
-                      f"({key_text(i)}) WHERE {col['name']} IS NOT NULL;",
+                  REF["partial"], actions=actions,
                   confirm=[f"Do any queries look up {col['name']} IS NULL via this index?"],
                   data={"null_frac": nf})
         elif top >= SKEW_FREQ and not mentions:
+            keys = ", ".join(key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"])
+            actions = (replace_index(i, keys, note="range-sharded; HASH PK suffix spreads the dominant value")
+                       if pk_hash else
+                       [manual(f"-- {i['name']}: exclude the dominant value with WHERE {col['name']} <> <value>, "
+                               "or add an A1 bucket prefix (the PK is not HASH)")])
             F.add("skewed-hash", "medium", "stats", i["fq"], "Skewed HASH index column",
                   f"One value of {t['fq']}.{col['name']} holds {top:.0%} of rows; its entries all sit on one tablet of {i['name']}.",
                   "Exclude the dominant value with a partial index if it's rarely queried, or range-shard "
                   f"({col['name']} ASC) with a HASH PK suffix.", REF["partial"] + "#case-2-dominant-single-value-skewed-distribution",
-                  confirm=["Is the dominant value queried through this index?"], data={"top_freq": top})
+                  actions=actions, confirm=["Is the dominant value queried through this index?"], data={"top_freq": top})
 
 
 def rule_range_tails(m, F):
@@ -650,11 +832,11 @@ def rule_range_tails(m, F):
         nd, src = m.distinct(t, k0)
         if nd is None or nd > LOWCARD_MAX:
             continue
-        cause = None
+        cause, mono_key = None, None
         if len(i["keys"]) > 1:
             r, _ = m.monotonic(t, i["keys"][1])
             if r:
-                cause = f"`{i['keys'][1]['expr']}` ({r}) follows it"
+                cause, mono_key = f"`{i['keys'][1]['expr']}` ({r}) follows it", i["keys"][1]
         if not cause and not i["is_unique"] and len(i["keys"]) == 1:
             pk = t["pk"]
             if pk and not pk["hash_count"]:
@@ -663,14 +845,23 @@ def rule_range_tails(m, F):
                     cause = f"the range PK suffix `{pk['keys'][0]['expr']}` ({r}) is appended to every entry"
         if not cause:
             continue
+        actions = []
+        if mono_key is not None and not i["is_unique"]:
+            mk = mono_key["expr"] if mono_key["attnum"] else f"({mono_key['expr']})"
+            rest = [key_sql(c) for c in i["keys"] if c is not k0]
+            bucketed = ", ".join([key_sql(k0), f"(yb_hash_code({mk}) % {m.buckets}) ASC"] + rest)
+            actions = [manual(replace_index(i, bucketed)[0]["sql"],
+                              note="option A: bucket inside each value (keeps ORDER BY within a value via skip scan)"),
+                       manual(replace_index(i, key_sql(k0))[0]["sql"],
+                              note="option B: drop the monotonic column (only if nothing filters/sorts on it)")]
         F.add("range-hot-tails", "medium", src or "schema", i["fq"], "One write tail per low-cardinality value",
               f"{i['name']} on {t['fq']} is range-sharded on ({key_text(i)}): `{k0['expr']}` has ~{int(nd)} values "
               f"and {cause}, so new rows for each value append at the end of that value's range.",
               "Fine if inserts spread across values and values ≥ nodes; a hotspot if most new rows share one "
               "value. Drop the monotonic column if nothing filters/sorts on it (with a HASH PK the suffix "
               "spreads entries), or add a bucket prefix (pattern A1).",
-              REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix", confidence="medium",
-              confirm=[f"What share of new rows get the same {k0['expr']} value?"],
+              REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix", actions=actions,
+              confidence="medium", confirm=[f"What share of new rows get the same {k0['expr']} value?"],
               data={"definition": i["definition"]})
 
 
@@ -689,12 +880,18 @@ def rule_presplit(m, F):
         vals = m.split_values(t, i["keys"][0])
         hint = (f" Known values allow SPLIT AT VALUES ({', '.join('(' + ql(v) + ')' for v in vals)})."
                 if vals else "")
+        actions = [manual(f"-- yb-admin -master_addresses <masters> list_tablets ysql.{m.meta.get('database')} "
+                          f"{i['name'] if not i['is_pk'] else t['name']}   # confirm the tablet count first")]
+        if vals and not i["is_pk"] and not i["is_unique"]:
+            actions.append(manual(replace_index(i, ", ".join(key_sql(c) for c in i["keys"]),
+                                                split_clause([ql(v) for v in vals]))[0]["sql"],
+                                  note="rebuild pre-split, then swap it in"))
         F.add("range-single-tablet", sev, "stats", i["fq"], "Range-sharded relation on a single tablet",
               f"{i['name']} on {t['fq']} ({int(rows):,} rows) is range-sharded and has 1 tablet: all reads and "
               f"writes go to one tablet leader until auto-splitting catches up.",
               "Pre-split new range indexes/tables with SPLIT AT VALUES; for existing ones, confirm auto-splitting "
               "is enabled and the tablet count in yb-admin (num_tablets can be stale)." + hint,
-              REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix",
+              REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix", actions=actions,
               confirm=["Current tablet count (yb-admin list_tablets) — the catalog value may be stale."])
 
 
@@ -712,6 +909,7 @@ def rule_partial(m, F):
         t = i["table"]
         k0 = i["keys"][0]
         if k0["attnum"] and _fixed_by_predicate(i["predicate"], k0["expr"]):
+            pk_cols = ", ".join(key_sql(c) for c in t["pk"]["keys"]) if t["pk"] else "<high-cardinality col> HASH"
             F.add("partial-keyed-on-predicate", "medium", "schema", i["fq"],
                   "Partial index keyed on its own predicate column",
                   f"{i['name']} on {t['fq']} is keyed on `{k0['expr']}`, which WHERE {i['predicate']} fixes to one value: "
@@ -720,6 +918,8 @@ def rule_partial(m, F):
                   "Key the partial index on the columns the queries filter or sort on, e.g. "
                   f"(<high-cardinality col> HASH, <sort col> DESC) WHERE {i['predicate']}.",
                   REF["partial"] + "#case-2-dominant-single-value-skewed-distribution",
+                  actions=[manual(replace_index(i, f"<filter col> HASH, <sort col> DESC")[0]["sql"],
+                                  note=f"replace the key with what the queries filter/sort on (PK is {pk_cols})")],
                   data={"definition": i["definition"]})
         # parameterized predicate columns (statements are normalized: literals look like $n too)
         pcols = [c["name"] for c in t.get("columns") or [] if _fixed_by_predicate(i["predicate"], c["name"])]
@@ -745,6 +945,9 @@ def _index_supports(i, attnums):
     return len(keys) >= n and set(keys[:n]) == set(attnums) and i["hash_count"] <= n
 
 
+INT_WIDTH = {"smallint": 2, "integer": 4, "bigint": 8}
+
+
 def rule_fk(m, F):
     for fk in m.fks:
         t = m.tables.get(str(fk["table_oid"]))
@@ -756,31 +959,54 @@ def rule_fk(m, F):
         if not any(_index_supports(i, attnums) for i in t["indexes"]):
             names = ", ".join(c["name"] for c in cols)
             rows = m.rows(t)
+            new = f"{t['name']}_{'_'.join(c['name'] for c in cols)}_idx"[:63]
             F.add("fk-without-index", "high" if rows and rows >= PRESPLIT_ROWS else "medium",
                   "stats" if rows else "schema", f"{t['fq']}.{fk['name']}", "Foreign key without a supporting index",
                   f"{t['fq']}({names}) references {ref['fq'] if ref else '?'} but no index leads with these columns: "
                   "each parent DELETE/key UPDATE scans the child table.",
                   "Create an index whose leading key columns are exactly the FK columns (a PK leading with them also counts).",
                   REF["fk"],
-                  ddl=f"CREATE INDEX {qi(t['name'] + '_' + '_'.join(c['name'] for c in cols) + '_idx')} "
-                      f"ON {qi(t['schema'])}.{qi(t['name'])} ({', '.join(qi(c['name']) for c in cols)});")
+                  actions=[act("create", f"CREATE INDEX IF NOT EXISTS {qi(new)} ON {tname(t)} "
+                               f"({', '.join(qi(c['name']) + (' HASH' if n == 0 else ' ASC') for n, c in enumerate(cols))});",
+                               "create", target=f"{t['schema']}.{new}",
+                               rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(new)};")])
         bad = [c for c in cols if c["type"] != c["ref_type"] and not
                ({re.sub(r"\(.*\)", "", c["type"]), re.sub(r"\(.*\)", "", c["ref_type"])} <= {"text", "character varying"})]
         if bad:
+            actions = []
+            for c in bad:
+                if INT_WIDTH.get(c["type"], 99) < INT_WIDTH.get(c["ref_type"], 0):
+                    actions.append(act("rewrite", f"ALTER TABLE {tname(t)} ALTER COLUMN {qi(c['name'])} TYPE {c['ref_type']};",
+                                       "alter", target=f"{t['fq']}.{c['name']}",
+                                       rollback=f"ALTER TABLE {tname(t)} ALTER COLUMN {qi(c['name'])} TYPE {c['type']};",
+                                       note="widen the child column to the parent's type (table rewrite)"))
+                else:
+                    actions.append(manual(f"-- align {t['fq']}.{c['name']} ({c['type']}) with "
+                                          f"{ref['fq'] if ref else '?'}.{c['ref_name']} ({c['ref_type']}): pick one type "
+                                          "for both sides (changing the parent rewrites it and its other children)"))
             F.add("fk-type-mismatch", "medium", "schema", f"{t['fq']}.{fk['name']}", "Foreign key type mismatch",
                   "; ".join(f"{c['name']} {c['type']} → {c['ref_name']} {c['ref_type']}" for c in bad) + ".",
                   "Use identical types on both sides: cross-type comparisons cost CPU per lookup, can change plans, "
-                  "and a narrower child type overflows first (INT child of BIGINT parent).", REF["fk"])
+                  "and a narrower child type overflows first (INT child of BIGINT parent).", REF["fk"],
+                  actions=actions)
 
 
 def rule_int_sequences(m, F):
     for s in m.sequences:
         if s["type"] in ("integer", "smallint") and s.get("owned_by"):
+            tbl, col = s["owned_by"].rsplit(".", 1)
+            seq = f"{qi(s['schema'])}.{qi(s['name'])}"
             F.add("int-sequence", "low", "schema", s["owned_by"], "Sequence-backed INT column",
                   f"{s['owned_by']} uses a {s['type']} sequence ({s['schema']}.{s['name']}).",
                   "Use BIGINT (GENERATED ... AS IDENTITY). Sequence values are cached per connection "
                   "(ysql_sequence_cache_minval, default 100), so values burn faster than rows are inserted.",
-                  REF["hotspots"])
+                  REF["hotspots"],
+                  actions=[act("rewrite", f"ALTER TABLE {tbl} ALTER COLUMN {col} TYPE bigint;\n"
+                                          f"ALTER SEQUENCE {seq} AS bigint;",
+                               "alter", target=s["owned_by"],
+                               rollback=f"ALTER SEQUENCE {seq} AS {s['type']};\n"
+                                        f"ALTER TABLE {tbl} ALTER COLUMN {col} TYPE {s['type']};",
+                               note="table rewrite; widen FK columns that reference it too")])
 
 
 def rule_invalid(m, F):
@@ -790,14 +1016,20 @@ def rule_invalid(m, F):
                   f"{i['name']} on {i['table']['fq']} is not valid (failed or interrupted CONCURRENTLY build): "
                   "it costs writes and serves no reads.",
                   "Drop and recreate it.", REF["index"],
-                  ddl=f"DROP INDEX {qi(i['table']['schema'])}.{qi(i['name'])};\n{i['definition']};")
+                  actions=[act("create", f"DROP INDEX IF EXISTS {iname(i)};\n{recreate_sql(i)}", "replace",
+                               target=i["fq"], note="rebuild")])
 
 
 def rule_gin(m, F):
     for i in m.indexes:
         if i["am"] == "ybgin" and i["nkey"] > 1:
+            t = i["table"]
+            per_col = "\n".join(f"CREATE INDEX IF NOT EXISTS {qi((i['name'] + '_' + str(n))[:63])} ON {tname(t)} "
+                                f"USING ybgin ({c['expr']} {c['opclass'] or ''});".replace(" ;", ";")
+                                for n, c in enumerate(i["keys"], 1))
             F.add("multi-column-gin", "medium", "schema", i["fq"], "Multi-column GIN index",
-                  f"{i['name']} has {i['nkey']} key columns.", "Use one GIN index per column.", REF["index"])
+                  f"{i['name']} has {i['nkey']} key columns.", "Use one GIN index per column.", REF["index"],
+                  actions=[manual(per_col + f"\nDROP INDEX IF EXISTS {iname(i)};")])
 
 
 def rule_analyze(m, F):
@@ -812,13 +1044,15 @@ def rule_analyze(m, F):
               REF["review"])
         return
     if stale:
-        names =", ".join(t["fq"] for t in stale[:15]) + (" …" if len(stale) > 15 else "")
+        names = ", ".join(t["fq"] for t in stale[:15]) + (" …" if len(stale) > 15 else "")
         F.add("missing-statistics", "medium" if m.cbo_on else "low", "stats", m.meta.get("database", "db"),
               "Tables without optimizer statistics",
               f"{len(stale)} table(s) have never been analyzed: {names}. Stats-based checks were skipped for them.",
               "Run ANALYZE (with the customer's agreement) — the cost-based optimizer relies on it. "
               "Auto Analyze is the default from 2025.2; check yb_disable_auto_analyze / ysql_enable_auto_analyze.",
-              REF["review"], data={"tables": [t["fq"] for t in stale]})
+              REF["review"],
+              actions=[act("prepare", f"ANALYZE {tname(t)};", "analyze", target=t["fq"]) for t in stale],
+              data={"tables": [t["fq"] for t in stale]})
 
 
 def rule_unused(m, F):
@@ -847,6 +1081,8 @@ def rule_unused(m, F):
               "jobs). Unused is not the same as redundant: an unused index may still be the right one for a "
               "rare query." + ("" if full else " Not all nodes were collected: usage counters are per node."),
               REF["index"], confidence="medium" if full else "low",
+              actions=[manual(f"DROP INDEX IF EXISTS {iname(i)};", note="unused: confirm the observation window",
+                              target=i["fq"], kind="drop") for i in idx],
               confirm=["How long is the observation window, and does it include periodic jobs?"],
               data={"indexes": [i["definition"] for i in idx]})
 
@@ -904,74 +1140,28 @@ def validate(b, m):
     return w
 
 
+def load_render():
+    """Import render.py from this directory (works under python -I, which drops the script dir)."""
+    import importlib.util
+    sys.dont_write_bytecode = True          # keep __pycache__ out of the skill directory
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
+    spec = importlib.util.spec_from_file_location("yb_review_render", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def write_outputs(out, b, m, findings, warnings):
     os.makedirs(out, exist_ok=True)
+    doc = {
+        "format": "yb-schema-review/findings/v1", "meta": m.meta, "warnings": warnings,
+        "statement_source": b.statement_source, "statement_count": len(b.statements),
+        "usage_file_count": len(b.usage), "table_count": len(m.tables), "index_count": len(m.indexes),
+        "top_statements": b.statements[:TOP_STATEMENTS], "findings": findings,
+    }
     with open(os.path.join(out, "findings.json"), "w", encoding="utf-8") as fh:
-        json.dump({"format": "yb-schema-review/findings/v1", "meta": m.meta, "warnings": warnings,
-                   "statement_source": b.statement_source, "findings": findings}, fh, indent=2, default=str)
-
-    ddl = [f for f in findings if f["suggested_ddl"]]
-    creates = [f for f in ddl if not f["suggested_ddl"].lstrip().upper().startswith("DROP")]
-    drops = [f for f in ddl if f["suggested_ddl"].lstrip().upper().startswith("DROP")]
-    with open(os.path.join(out, "proposed.sql"), "w", encoding="utf-8") as fh:
-        fh.write("-- Proposed changes from the YugabyteDB schema review. REVIEW ONLY: nothing here has been run.\n"
-                 "-- Order: create replacements, verify plans on staging, then drop. See references/review-mode.md.\n\n")
-        for title, group in (("1. Create / replace", creates), ("2. Drop (after verification)", drops)):
-            fh.write(f"-- ===== {title} =====\n\n")
-            for f in group:
-                fh.write(f"-- {f['id']} [{f['severity']}] {f['rule']}: {f['object']}\n{f['suggested_ddl']}\n\n")
-
-    L = []
-    L.append(f"# YugabyteDB schema review: {m.meta.get('database')}\n")
-    L.append(f"- Exported: {m.meta.get('exported_at')}  \n- Version: {m.meta.get('version')}  ")
-    L.append(f"- Nodes: {m.node_count} {m.meta.get('placements') or ''}  \n- Tables: {len(m.tables)}, indexes: {len(m.indexes)}  ")
-    L.append(f"- Statements: {len(b.statements)} ({b.statement_source or 'none'})  \n- Usage files: {len(b.usage)}\n")
-    if warnings:
-        L.append("## Bundle warnings\n")
-        L += [f"- {x}" for x in warnings]
-        L.append("")
-    counts = defaultdict(int)
-    for f in findings:
-        counts[f["severity"]] += 1
-    L.append("## Summary\n")
-    L.append("| Severity | Count |\n|---|---|")
-    L += [f"| {s} | {counts[s]} |" for s in SEV_ORDER if counts[s]]
-    L.append("\nEvidence: **schema** = from DDL (candidate), **stats** = backed by pg_stats/row counts, "
-             "**workload** = backed by statements/usage.\n")
-    L.append("## Findings\n")
-    for f in findings:
-        L.append(f"### {f['id']} [{f['severity']}] {f['title']} — `{f['object']}`\n")
-        L.append(f"*Rule `{f['rule']}` · evidence: {f['evidence']} · confidence: {f['confidence']} · see `{f['reference']}`*\n")
-        L.append(f"{f['detail']}\n\n**Recommendation:** {f['recommendation']}\n")
-        if f["suggested_ddl"]:
-            L.append(f"```sql\n{f['suggested_ddl']}\n```\n")
-        if f["needs_confirmation"]:
-            L.append("Confirm: " + " ".join(f"☐ {q}" for q in f["needs_confirmation"]) + "\n")
-    questions = [(f["id"], q) for f in findings for q in f["needs_confirmation"]]
-    if questions:
-        L.append("## Questions for the customer\n")
-        grouped = defaultdict(list)
-        for i, q in questions:
-            grouped[q].append(i)
-        L += [f"- ({', '.join(ids)}) {q}" for q, ids in grouped.items()]
-        L.append("")
-    if any(f["rule"] in ("redundant-index", "unused-index") for f in findings):
-        L.append("## Before dropping any index\n")
-        L.append("- No query hint (`pg_hint_plan` `IndexScan(t idx)`) or application code names it.")
-        L.append("- Usage counters were collected on **every** node (they are per node) over a full business cycle.")
-        L.append("- It doesn't back a constraint the application relies on (checked automatically for PK/UNIQUE/FK).")
-        L.append("- Keep the recreate statement (in `proposed.sql`); drop one index at a time and watch latency.\n")
-    if b.statements:
-        L.append(f"## Top {TOP_STATEMENTS} statements by total time\n")
-        L.append("| # | calls | total ms | rows | DocDB rows scanned | nodes | query |\n|---|---|---|---|---|---|---|")
-        for n, s in enumerate(b.statements[:TOP_STATEMENTS], 1):
-            q = re.sub(r"\s+", " ", s["query"])[:120].replace("|", "\\|")
-            L.append(f"| {n} | {s['calls']:,} | {s['total_time_ms']:,.0f} | {s['rows']:,} | "
-                     f"{'' if s['docdb_rows_scanned'] is None else format(s['docdb_rows_scanned'], ',')} | "
-                     f"{len(s['nodes'])} | `{q}` |")
-        L.append("")
-    with open(os.path.join(out, "report.md"), "w", encoding="utf-8") as fh:
-        fh.write("\n".join(L))
+        json.dump(doc, fh, indent=2, default=str)
+    return load_render().render_all(json.loads(json.dumps(doc, default=str)), out)
 
 
 def main():
@@ -987,12 +1177,13 @@ def main():
     findings = F.sorted()
     warnings = validate(b, m)
     out = args.out or os.path.join(args.bundle, "review")
-    write_outputs(out, b, m, findings, warnings)
+    phases, n_manual = write_outputs(out, b, m, findings, warnings)
     counts = defaultdict(int)
     for f in findings:
         counts[f["severity"]] += 1
-    print(f"{len(findings)} findings ({', '.join(f'{v} {k}' for k, v in sorted(counts.items(), key=lambda x: SEV_ORDER[x[0]]))}) "
-          f"→ {out}/report.md, findings.json, proposed.sql")
+    print(f"{len(findings)} findings ({', '.join(f'{v} {k}' for k, v in sorted(counts.items(), key=lambda x: SEV_ORDER[x[0]]))})")
+    print(f"changes.sql: {', '.join(f'{p} {n}' for p, n in phases.items()) or 'no changes'}, {n_manual} manual")
+    print(f"→ {out}/report.md, findings.json, changes.sql, rollback.sql")
     for x in warnings:
         print(f"warning: {x}", file=sys.stderr)
 

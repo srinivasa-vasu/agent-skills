@@ -26,7 +26,8 @@ This skill covers **how to design schemas well** for YugabyteDB: the design patt
   (they have, or can produce, a schema dump / stats export / statements file). Read
   `references/review-mode.md` first. It covers the bundle, safety rules, the scripts, how to triage
   the analyzer's findings, and the rollout runbook. Never run DDL or `ANALYZE` against the user's
-  database; recommendations go into `proposed.sql`.
+  database. Changes go into `changes.sql` (phased, with `rollback.sql`), rendered from the
+  triaged `findings.json` so the SQL always matches the report.
 
 ## Core Concepts (Read First)
 
@@ -52,9 +53,10 @@ Read only the section(s) relevant to the user's question:
 
 ## Scripts (review mode)
 
-- `scripts/collect.sh` — read-only collector: schema dump, `stats.json`, per-node `usage/*.json`
+- `scripts/collect.sh` — read-only collector: schema dump, `stats.json`, per-node `usage/*.json` (TLS: `--sslrootcert`)
 - `scripts/export-stats.sql` / `scripts/export-usage.sql` — the exports, runnable by hand with `ysqlsh`
-- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle → `report.md`, `findings.json`, `proposed.sql`
+- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle → `findings.json`, `report.md`, `changes.sql`, `rollback.sql`
+- `scripts/render.py` — re-renders `report.md` / `changes.sql` / `rollback.sql` from a triaged `findings.json`
 - `scripts/checks/*.sql` — standalone live checks: `hash_on_range_type.sql`, `redundant_indexes.sql`
 
 ## Quick Decision Guide
