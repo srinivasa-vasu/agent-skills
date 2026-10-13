@@ -192,6 +192,37 @@ def render_rollback(doc, findings, accepted_only):
     return "\n".join(L) + "\n"
 
 
+REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (changes.sql has all)
+PHASE_LABEL = {"prepare": "prepare", "create": "create", "drop": "drop", "rewrite": "rewrite",
+               "manual": "manual (commented out in changes.sql)"}
+
+
+def changes_section(actions):
+    """One line per phase (with statement count and distinct notes), then the SQL, capped."""
+    L = ["**Changes:**\n"]
+    by_phase = defaultdict(list)
+    for a in actions:
+        by_phase[a["phase"]].append(a)
+    for p in ["prepare", "create", "drop", "rewrite", "manual"]:
+        acts = by_phase.get(p)
+        if not acts:
+            continue
+        notes = list(dict.fromkeys(a["note"] for a in acts if a.get("note")))
+        count = f" ×{len(acts)}" if len(acts) > 1 else ""
+        L.append(f"- `{PHASE_LABEL[p]}`{count}" + (f": {'; '.join(notes)}" if notes else ""))
+    lines = []
+    for a in actions:
+        # the report shows the statements; changes.sql keeps the ysqlsh re-run guards (\gset, \if)
+        sql = "\n".join(line for line in a["sql"].splitlines()
+                         if not line.lstrip().startswith("\\") and not line.rstrip().endswith("\\gset"))
+        lines += (comment_block(sql) if a["phase"] == "manual" else sql).splitlines()
+    if len(lines) > REPORT_SQL_LINES:
+        more = len(lines) - REPORT_SQL_LINES
+        lines = lines[:REPORT_SQL_LINES] + [f"-- … {more} more line(s): see changes.sql"]
+    L.append("\n```sql\n" + "\n".join(lines) + "\n```\n")
+    return L
+
+
 def render_report(doc, findings, accepted_only):
     meta = doc.get("meta", {})
     live = [f for f in findings if f.get("status") != "rejected"]
@@ -230,13 +261,7 @@ def render_report(doc, findings, accepted_only):
         if f.get("review_note"):
             L.append(f"**Review note:** {f['review_note']}\n")
         if f["actions"]:
-            L.append("**Changes** (phase → SQL):\n")
-            for a in f["actions"]:
-                note = f" — {a['note']}" if a.get("note") else ""
-                L.append(f"- `{a['phase']}`{note}")
-            L.append("```sql\n" + "\n".join(
-                (comment_block(a["sql"]) if a["phase"] == "manual" else a["sql"]) for a in f["actions"])
-                + "\n```\n")
+            L += changes_section(f["actions"])
         if f["needs_confirmation"]:
             L.append("Confirm: " + " ".join(f"☐ {q}" for q in f["needs_confirmation"]) + "\n")
     if rejected:
