@@ -109,7 +109,8 @@ With a hot tail per value you get at most K write hot spots for K distinct value
 when new rows spread evenly across values and K ≥ node count; it's a hotspot when most new rows
 share one value (e.g. every new order is `'pending'`). Fixes: drop the monotonic column from the
 key if nothing sorts or filters on it (and rely on a HASH PK suffix), or bucket the monotonic
-column **inside** each value: `(status ASC, (yb_hash_code(created_at) % N) ASC, created_at ASC)`
+column **inside** each value: `(status ASC, (yb_hash_code(order_id) % N) ASC, created_at ASC)`,
+bucketing on the primary key (a batch inserted in one transaction shares `now()`)
 ([A1 inside a low-cardinality value](hotspots.md#a1-inside-a-low-cardinality-value)). Equality on
 `status` still seeks, and each value's new rows spread across N buckets.
 
@@ -152,7 +153,7 @@ CREATE INDEX idx_active_users ON users(created_at DESC) WHERE is_active = true;
 -- ✅ If both values are queried: range-shard and pre-split on the boolean
 CREATE INDEX idx_active ON users(is_active ASC) SPLIT AT VALUES (('true'));
 -- false < true: one tablet per value from day one; a HASH PK suffix spreads each value further.
--- With a monotonic column after it, bucket it: (is_active ASC, (yb_hash_code(created_at) % 3) ASC, created_at ASC)
+-- With a monotonic column after it, bucket on the PK: (is_active ASC, (yb_hash_code(user_id) % 3) ASC, created_at ASC)
 
 -- ❌ Don't "fix" it by prefixing the PK column:
 CREATE INDEX idx_active ON users(user_id HASH, is_active);

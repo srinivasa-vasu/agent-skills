@@ -7,15 +7,17 @@ Reads a review bundle and writes findings.json, report.md, changes.sql and rollb
 Never connects to a database and never executes DDL. Python 3.8+, stdlib only.
 
     python3 analyze.py BUNDLE_DIR [--out OUT_DIR]
+    python3 analyze.py schema.sql [--out OUT_DIR] [--range-default]     # schema only, no stats
 
-Bundle layout (only stats.json is required):
+Bundle layout (stats.json or schema.sql is required):
 
     BUNDLE_DIR/
       stats.json          export-stats.sql      catalog + pg_stats (one node)
       usage/*.json        export-usage.sql      per-node index/table usage + pg_stat_statements
       statements/*.json   tserver :13000/statements per node, a pg_stat_statements JSON
                           array, or one consolidated file (see references/review-mode.md)
-      schema.sql          ysql_dump --schema-only --include-yb-metadata (read by the model, not parsed here)
+      schema.sql          ysql_dump --schema-only --include-yb-metadata, or DDL. Parsed into the
+                          catalog (schema_sql.py) only when stats.json is absent.
 
 Each finding carries an evidence level:
     schema    derived from DDL alone (candidate)
@@ -52,7 +54,18 @@ SUSPECT_LOWCARD_TYPES = {"smallint", '"char"'}
 TIME_DEFAULT_RE = re.compile(
     r"\b(now|clock_timestamp|statement_timestamp|transaction_timestamp)\s*\(|"
     r"\bCURRENT_(TIMESTAMP|DATE)\b|\bLOCALTIMESTAMP\b", re.I)
-TIME_NAME_RE = re.compile(r"(^|_)(created|inserted|ingested|logged|recorded|event_time|ts|timestamp)(_|$)|_(at|on|time|ts)$", re.I)
+# date/time columns whose name suggests "set to now() on insert or update" (snake_case or camelCase)
+TIME_NAME_STEM_RE = re.compile(
+    r"^(created|inserted|ingested|logged|recorded|received|modified|updated|changed|"
+    r"lastmodified|lastupdated|lastchanged|eventtime|ts|timestamp)"
+    r"(at|on|date|time|ts|timestamp|datetime|dt)?$")
+TIME_NAME_SUFFIX_RE = re.compile(r"(_(at|on|time|ts|date|dt)$)|([a-z0-9](At|On|Time|Ts|Date|Dt)$)")
+
+
+def time_like_name(name):
+    """created_at, createdAt, modified_date, modifiedDate, updatedAt, last_modified, event_ts, ..."""
+    return bool(TIME_NAME_STEM_RE.match(re.sub(r"[^a-z]", "", name.lower()))
+                or TIME_NAME_SUFFIX_RE.search(name))
 
 # statements worth reviewing; DDL, utility and session commands are dropped
 DML_RE = re.compile(r"^\s*(/\*.*?\*/\s*)*\(?\s*(SELECT|INSERT|UPDATE|DELETE|WITH|MERGE|VALUES|TABLE|COPY)\b", re.I | re.S)
@@ -88,8 +101,24 @@ def ql(value):
 
 # --------------------------------------------------------------------------- loading
 
+def load_sibling(name):
+    """Import a module from this directory (works under python -I, which drops the script dir)."""
+    import importlib.util
+    sys.dont_write_bytecode = True          # keep __pycache__ out of the skill directory
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    spec = importlib.util.spec_from_file_location("yb_review_" + name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class Bundle:
-    def __init__(self, path):
+    def __init__(self, path, range_default=False):
+        self.schema_file = None
+        if os.path.isfile(path):                # analyze.py schema.sql
+            self.schema_file = path
+            path = os.path.dirname(os.path.abspath(path))
+        self.range_default = range_default
         self.path = path
         self.warnings = []
         self.stats = None
@@ -108,12 +137,23 @@ class Bundle:
 
     def _load(self):
         sp = os.path.join(self.path, "stats.json")
-        if not os.path.exists(sp):
-            sys.exit(f"{sp} not found. Run export-stats.sql (live) or replay schema.sql into a "
-                     f"scratch cluster first (see references/review-mode.md).")
-        self.stats = self._read_json(sp)
-        if not self.stats or self.stats.get("format") != "yb-schema-review/stats/v1":
-            sys.exit("stats.json is not a yb-schema-review/stats/v1 export.")
+        schema = self.schema_file or os.path.join(self.path, "schema.sql")
+        if self.schema_file or not os.path.exists(sp):
+            if not os.path.exists(schema):
+                sys.exit(f"Neither {sp} nor {schema} found. Collect a bundle (collect.sh / export-stats.sql) "
+                         "or provide schema.sql (see references/review-mode.md).")
+            # schema-only review: build the catalog from the DDL
+            self.stats, parse_warnings = load_sibling("schema_sql").parse(
+                schema, hash_default=not self.range_default)
+            self.warnings += [f"schema.sql: {w}" for w in parse_warnings]
+            self.warnings.append(f"Catalog parsed from {os.path.basename(schema)} (no database): no statistics, "
+                                 "row counts or tablet counts beyond what the DDL states.")
+            self.from_schema = True
+        else:
+            self.stats = self._read_json(sp)
+            self.from_schema = False
+            if not self.stats or self.stats.get("format") != "yb-schema-review/stats/v1":
+                sys.exit("stats.json is not a yb-schema-review/stats/v1 export.")
 
         for f in sorted(glob.glob(os.path.join(self.path, "usage", "*.json"))):
             d = self._read_json(f)
@@ -286,8 +326,8 @@ class Model:
         if col["base_type"] in TIME_TYPES:
             if TIME_DEFAULT_RE.search(d):
                 return f"default {d}", "high"
-            if TIME_NAME_RE.search(col["name"]):
-                return "timestamp-like column name", "medium"
+            if time_like_name(col["name"]):
+                return "name suggests it is set to the current time", "medium"
         return None, None
 
     def split_values(self, t, keycol):
@@ -295,6 +335,8 @@ class Model:
         col = self.table_col(t, keycol)
         if col is None:
             return None
+        if col["base_type"] == "boolean":
+            return ["true"]                    # false < true: one split, one tablet per value
         labels = self.enums.get(col["type"]) or self.enums.get(col["base_type"])
         if labels:
             vals = labels                      # enum sort order = declared order
@@ -478,6 +520,19 @@ def bucket_keys(m, i, k, desc=False):
     rest = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"] if c is not k]
     col = f"{expr} {'DESC' if desc else ('ASC' if k['opt'] == 'HASH' else k['opt'])}"
     return ", ".join([f"(yb_hash_code({expr}) % {m.buckets}) ASC", col] + rest)
+
+
+def inner_bucket(m, t, i, mono_key):
+    """Bucket expression for the 'bucket inside each value' pattern. Prefer the PK column: rows
+    inserted in one transaction share now(), so hashing the timestamp would put a whole batch in
+    one bucket. Fall back to the monotonic column. -> (sql, column label)"""
+    pk = t["pk"]
+    used = {c["attnum"] for c in i["keys"]}
+    if pk and pk["keys"] and pk["keys"][0]["attnum"] and pk["keys"][0]["attnum"] not in used:
+        col = pk["keys"][0]["expr"]
+    else:
+        col = mono_key["expr"] if mono_key["attnum"] else f"({mono_key['expr']})"
+    return f"(yb_hash_code({col}) % {m.buckets}) ASC", col
 
 
 def pk_alter(t, i, keys):
@@ -706,7 +761,7 @@ def rule_monotonic_range(m, F):
               f"{what} leads with a monotonic range column",
               f"{i['name']} on {t['fq']} is range-sharded on `{k0['expr']} {k0['opt']}` ({reason}).",
               rec, REF["hotspots"], actions=actions, confidence=conf,
-              confirm=([] if conf == "high" else [f"Is {t['fq']}.{k0['expr']} set to the current time on insert?"])
+              confirm=([] if conf == "high" else [f"Is {t['fq']}.{k0['expr']} set to the current time on insert or update?"])
               + ([f"Do queries range-scan or ORDER BY {t['fq']}.{k0['expr']}?"] if i["is_pk"] else []),
               data={"definition": i["definition"]})
 
@@ -765,30 +820,64 @@ def rule_lowcard_hash(m, F):
             pk = t["pk"]
             pk_hash = bool(pk and pk["hash_count"])
             range_cols = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"]]
-            mono_next = len(i["keys"]) > 1 and m.monotonic(t, i["keys"][1])[0]
-            if mono_next:
-                # (lowcard ASC, ts ASC) would give one write tail per value: bucket the monotonic column
-                k1 = i["keys"][1]
-                k1e = k1["expr"] if k1["attnum"] else f"({k1['expr']})"
-                range_cols.insert(1, f"(yb_hash_code({k1e}) % {m.buckets}) ASC")
-            range_keys = ", ".join(range_cols)
+            k1 = i["keys"][1] if len(i["keys"]) > 1 else None
+            mono_next = k1 is not None and m.monotonic(t, k1)[0]
+            pk0 = pk["keys"][0] if pk and pk["keys"] else None
             split = split_clause([ql(v) for v in vals]) if vals and i["hash_count"] == 1 else ""
             rec = (f"All rows with one {hk} value share a hash code, so they sit on one tablet that can't split "
-                   f"(at most {int(est)} tablets ever). Options: (1) lead with a high-cardinality HASH column the "
-                   f"queries filter on; (2) range-shard it ({hk} ASC) and pre-split")
-            rec += (" — the HASH primary key suffix spreads entries within each value." if pk_hash else
-                    " — but this table's PK is not HASH, so each value gets a write tail; add a bucket (pattern A1).")
-            rec += " (3) A partial index if only some values are queried."
+                   f"(at most {int(est)} tablets ever). Range-shard it ({hk} ASC)")
+            if mono_next:
+                # (lowcard ASC, ts ASC, pk): ts precedes the PK suffix, so every new row of a value
+                # sorts after all existing ones -> one write tail per value, splits don't divide it
+                bexpr, bcol = inner_bucket(m, t, i, k1)
+                bucketed = list(range_cols)
+                bucketed.insert(1, bexpr)
+                range_keys = ", ".join(bucketed)
+                rec += (f" with a bucket inside each value. `{k1['expr']}` follows it and only increases, and it comes before the primary-key "
+                        "suffix in the index key: every new row for a value sorts after all existing ones, so "
+                        "writes go to that value's last tablet even after splits (the PK suffix only orders "
+                        f"rows with the same {k1['expr']}). The generated index adds an A1 bucket on "
+                        f"{bcol} (N={m.buckets}) inside each value; once auto-split divides the index at bucket "
+                        "boundaries, each bucket's writes go to their own tablet (no pre-split needed). Cost: "
+                        f"`WHERE {hk} = … ORDER BY {k1['expr']} LIMIT n` merges N sorted streams (no sort from "
+                        "v2025.2.1; older versions sort). Alternatives under manual decisions: a partial index "
+                        f"keyed on {k1['expr']} for the value the queries poll (typical for queue tables), or "
+                        "no bucket when the insert rate is low.")
+                note = f"A1 bucket on {bcol} (N={m.buckets}): {k1['expr']} is monotonic and precedes the PK suffix"
+            elif pk_hash:
+                range_keys = ", ".join(range_cols)
+                rec += (" and pre-split on its values: the HASH primary-key suffix spreads entries within each "
+                        "value as the index splits.")
+                note = "range-sharded; HASH PK suffix spreads each value"
+            else:
+                # range PK: the suffix is ordered too; bucket on the PK (high cardinality), not on the
+                # low-cardinality column, whose hash has only as many values as the column itself
+                pke = pk0["expr"] if pk0 and pk0["attnum"] else None
+                range_keys = ", ".join(range_cols[:1] + ([f"(yb_hash_code({pke}) % {m.buckets}) ASC"] if pke else [])
+                                       + range_cols[1:])
+                rec += (": this table's PK is range-sharded, so the PK suffix doesn't spread entries; the "
+                        f"generated index adds an A1 bucket on {pke} inside each value.")
+                note = f"A1 bucket on the PK column {pke} (N={m.buckets})"
+            rec += " If only some values are queried, a partial index is smaller still."
             if i["is_unique"]:
                 actions = [manual(f"-- unique index {i['name']}: reshape by hand, keeping the same uniqueness rule")]
-            elif pk_hash or mono_next:
-                actions = replace_index(i, range_keys, split,
-                                        note=f"range-sharded; A1 bucket on {i['keys'][1]['expr']} (N={m.buckets}) "
-                                             "spreads each value's new rows" if mono_next else
-                                             "range-sharded; HASH PK suffix spreads each value")
             else:
-                actions = replace_index(i, bucket_keys(m, i, i["keys"][0]), bucket_split(m.buckets),
-                                        note=f"range PK suffix: A1 bucket prefix, N={m.buckets}")
+                # bucketed keys: no SPLIT AT VALUES; auto-split divides at (value, bucket) boundaries,
+                # after which each bucket's writes go to their own tablet
+                bucketed_key = mono_next or not pk_hash
+                actions = replace_index(i, range_keys, "" if bucketed_key else split, note=note)
+                if mono_next:
+                    rest = ", ".join(key_sql(c) for c in i["keys"][1:])
+                    inc = f" INCLUDE ({', '.join(c['expr'] for c in i['include'])})" if i["include"] else ""
+                    pred = (f"({i['predicate']}) AND " if i["predicate"] else "") + f"{hk} = <polled value>"
+                    actions += [
+                        manual(f"CREATE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
+                               f"({rest}){inc} WHERE {pred};",
+                               note=f"alternative for queue polling: partial index on the value the queries "
+                                    f"poll; small, and rows leave it when {hk} changes"),
+                        manual(replace_index(i, ", ".join(range_cols), split)[0]["sql"],
+                               note="alternative for low insert rates: no bucket (one write tail per value)"),
+                    ]
         F.add("low-cardinality-hash", sev, ev, i["fq"],
               "HASH sharding on a low-cardinality key",
               f"{i['name']} on {t['fq']} hashes on ({hk}): ~{int(est)} distinct values"
@@ -855,7 +944,9 @@ def rule_skew_or_nulls(m, F):
 
 
 def rule_range_tails(m, F):
-    """Low-cardinality leading range column followed by a monotonic key: one hot tail per value."""
+    """Range index led by a low-cardinality or skewed column, followed by a monotonic column:
+    every new row of a value lands at the newest end of that value's range (one hot spot per value).
+    Splits don't help: the monotonic column sorts before the PK suffix."""
     for i in m.indexes:
         if i["am"] != "lsm" or i["is_partition"] or not i["keys"] or i["is_pk"]:
             continue
@@ -864,14 +955,21 @@ def rule_range_tails(m, F):
             continue
         t = i["table"]
         nd, src = m.distinct(t, k0)
-        if nd is None or nd > LOWCARD_MAX:
+        col0 = m.table_col(t, k0)
+        st0 = m.colstat(t, col0["name"]) if col0 else None
+        top = ((st0 or {}).get("most_common_freqs") or [0])[0] or 0
+        lowcard = nd is not None and nd <= LOWCARD_MAX
+        skewed = not lowcard and top >= SKEW_FREQ
+        if not (lowcard or skewed):
             continue
-        cause, mono_key = None, None
+        cause, mono_key, where = None, None, "end"
         if len(i["keys"]) > 1:
             r, _ = m.monotonic(t, i["keys"][1])
             if r:
-                cause, mono_key = f"`{i['keys'][1]['expr']}` ({r}) follows it", i["keys"][1]
-        if not cause and not i["is_unique"] and len(i["keys"]) == 1:
+                mono_key = i["keys"][1]
+                where = "start" if mono_key["opt"] == "DESC" else "end"
+                cause = f"`{mono_key['expr']} {mono_key['opt']}` ({r}) follows it"
+        if not cause and lowcard and not i["is_unique"] and len(i["keys"]) == 1:
             pk = t["pk"]
             if pk and not pk["hash_count"]:
                 r, _ = m.monotonic(t, pk["keys"][0])
@@ -879,23 +977,37 @@ def rule_range_tails(m, F):
                     cause = f"the range PK suffix `{pk['keys'][0]['expr']}` ({r}) is appended to every entry"
         if not cause:
             continue
+        what = (f"`{k0['expr']}` has ~{int(nd)} values" if lowcard else
+                f"one `{k0['expr']}` value holds {top:.0%} of rows")
         actions = []
         if mono_key is not None and not i["is_unique"]:
-            mk = mono_key["expr"] if mono_key["attnum"] else f"({mono_key['expr']})"
+            bexpr, bcol = inner_bucket(m, t, i, mono_key)
             rest = [key_sql(c) for c in i["keys"] if c is not k0]
-            bucketed = ", ".join([key_sql(k0), f"(yb_hash_code({mk}) % {m.buckets}) ASC"] + rest)
+            bucketed = ", ".join([key_sql(k0), bexpr] + rest)
             actions = [manual(replace_index(i, bucketed)[0]["sql"],
-                              note="option A: bucket inside each value (keeps ORDER BY within a value via skip scan)"),
+                              note=f"option A: bucket on {bcol} inside each value (N={m.buckets}); "
+                                   f"ORDER BY {mono_key['expr']} within a value merges N streams"),
                        manual(replace_index(i, key_sql(k0))[0]["sql"],
                               note="option B: drop the monotonic column (only if nothing filters/sorts on it)")]
-        F.add("range-hot-tails", "medium", src or "schema", i["fq"], "One write tail per low-cardinality value",
-              f"{i['name']} on {t['fq']} is range-sharded on ({key_text(i)}): `{k0['expr']}` has ~{int(nd)} values "
-              f"and {cause}, so new rows for each value append at the end of that value's range.",
-              "Fine if inserts spread across values and values ≥ nodes; a hotspot if most new rows share one "
-              "value. Drop the monotonic column if nothing filters/sorts on it (with a HASH PK the suffix "
-              "spreads entries), or add a bucket prefix (pattern A1).",
-              REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix", actions=actions,
-              confidence="medium", confirm=[f"What share of new rows get the same {k0['expr']} value?"],
+            if skewed:
+                actions.append(manual(replace_index(i, f"{k0['expr']} HASH, {key_sql(mono_key)}")[0]["sql"],
+                                      note=f"option C: only if every query filters on {k0['expr']}: HASH spreads "
+                                           "the other values, but the dominant value stays on one tablet"))
+        F.add("range-hot-tails", "medium", src or ("stats" if skewed else "schema"), i["fq"],
+              "One write hot spot per value" if lowcard else "Write hot spot on a dominant value",
+              f"{i['name']} on {t['fq']} is range-sharded on ({key_text(i)}): {what} and {cause}, so new and "
+              f"updated rows for each value land at the {where} of that value's range. Splits don't divide those "
+              "writes: the monotonic column sorts before the primary-key suffix.",
+              ("Fine if writes spread across values and values ≥ nodes; a hot spot if most writes share one value. "
+               if lowcard else
+               f"The dominant {k0['expr']} value's writes all go to one tablet. ")
+              + "Bucket inside each value (A1 on the primary key, so a batch inserted in one transaction "
+              "doesn't share one bucket), or drop the monotonic column if nothing filters/sorts on it.",
+              REF["hotspots"] + "#a1-inside-a-low-cardinality-value", actions=actions,
+              confidence="medium",
+              confirm=[f"What share of new/updated rows get the same {k0['expr']} value?"]
+              + ([f"Is {mono_key['expr']} set to the current time on insert or update?"]
+                 if mono_key is not None and m.monotonic(t, mono_key)[1] != "high" else []),
               data={"definition": i["definition"]})
 
 
@@ -1175,14 +1287,7 @@ def validate(b, m):
 
 
 def load_render():
-    """Import render.py from this directory (works under python -I, which drops the script dir)."""
-    import importlib.util
-    sys.dont_write_bytecode = True          # keep __pycache__ out of the skill directory
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
-    spec = importlib.util.spec_from_file_location("yb_review_render", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return load_sibling("render")
 
 
 def write_outputs(out, b, m, findings, warnings):
@@ -1200,17 +1305,24 @@ def write_outputs(out, b, m, findings, warnings):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bundle", help="bundle directory containing stats.json")
+    ap.add_argument("bundle", help="bundle directory (stats.json or schema.sql), or a schema.sql file")
     ap.add_argument("--out", help="output directory (default: BUNDLE/review)")
+    ap.add_argument("--range-default", action="store_true",
+                    help="schema.sql only: keys without HASH/ASC are range (yb_use_hash_splitting_by_default = off)")
     args = ap.parse_args()
-    b = Bundle(args.bundle)
+    b = Bundle(args.bundle, range_default=args.range_default)
     m = Model(b)
     F = Findings()
     for rule in RULES:
         rule(m, F)
     findings = F.sorted()
+    # every finding about an existing index carries its current definition (shown in report.md)
+    defs = {i["fq"]: i["definition"] for i in m.indexes}
+    for f in findings:
+        if f["object"] in defs and "redundant" not in f["data"]:
+            f["data"].setdefault("definition", defs[f["object"]])
     warnings = validate(b, m)
-    out = args.out or os.path.join(args.bundle, "review")
+    out = args.out or os.path.join(b.path, "review")
     phases, n_manual = write_outputs(out, b, m, findings, warnings)
     counts = defaultdict(int)
     for f in findings:

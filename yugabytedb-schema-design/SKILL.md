@@ -56,6 +56,7 @@ Read only the section(s) relevant to the user's question:
 - `scripts/collect.sh` — read-only collector: schema dump, `stats.json`, per-node `usage/*.json` (TLS: `--sslrootcert`)
 - `scripts/export-stats.sql` / `scripts/export-usage.sql` — the exports, runnable by hand with `ysqlsh`
 - `scripts/analyze.py` — offline analyzer (stdlib Python): bundle → `findings.json`, `report.md`, `changes.sql`, `rollback.sql`
+- `scripts/schema_sql.py` — parses `schema.sql` (ysql_dump or hand-written DDL) into the catalog, for schema-only review (`analyze.py schema.sql`)
 - `scripts/render.py` — re-renders `report.md` / `changes.sql` / `rollback.sql` from a triaged `findings.json`
 - `scripts/checks/*.sql` — standalone live checks: `hash_on_range_type.sql`, `redundant_indexes.sql`
 

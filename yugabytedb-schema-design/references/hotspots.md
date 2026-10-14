@@ -59,26 +59,48 @@ partially specified HASH key, which is why A2 below needs the explicit `IN (...)
 
 ### A1 inside a low-cardinality value
 
-When a low-cardinality column leads the index and a monotonic column follows it, every value gets
-its own write tail (`(status ASC, created_at ASC)`: new rows append at the end of each status
-range). Put the bucket **after** the low-cardinality column, so equality on it still seeks and
-each value's new rows spread across N buckets:
+When a low-cardinality or skewed column leads the index and a monotonic column follows it, every
+value gets its own write hot spot (`(status ASC, created_at ASC)`: new rows append at the end of
+each status range; with `DESC`, at the start). Splitting doesn't help: the monotonic column sorts
+before the primary-key suffix, so every new entry is newer than every split point. Put a bucket
+**after** the leading column, so equality on it still seeks and each value's writes spread across
+N buckets:
 
 ```sql
 -- ❌ one write tail per status value
 CREATE INDEX idx_orders_status_created ON orders(status ASC, created_at ASC);
 
--- ✅ bucket inside each status value
+-- ✅ bucket inside each status value (bucket on the primary key)
 CREATE INDEX idx_orders_status_created ON orders(
     status ASC,
-    (yb_hash_code(created_at) % 3) ASC,
+    (yb_hash_code(order_id) % 3) ASC,
     created_at ASC
-) SPLIT AT VALUES (('cancelled'), ('pending'), ('shipped'));   -- split on the status values
+);
 
 -- WHERE status = 'pending' AND created_at > ... seeks to the status, then skip-scans the 3 buckets
 ```
 
-The same applies to booleans and small code columns (`(is_done ASC, (yb_hash_code(created_at) % N) ASC, created_at ASC)`).
+No pre-split is needed here: once auto-split divides the index at `(status, bucket)` boundaries,
+each bucket's writes go to their own tablet. (Splitting only on the status values would not help
+on day one either: all buckets of a status would still share one tablet.)
+
+**Bucket on the primary key, not on the timestamp.** `now()` is fixed for a whole transaction, so
+rows inserted in one transaction share `created_at`: hashing it would put the whole batch in one
+bucket. The primary key differs per row.
+
+The same applies to booleans, small code columns, and a skewed tenant column with a modified
+timestamp:
+
+```sql
+-- ❌ one tenant holds most rows: all its new/updated rows land at the start of its range
+CREATE INDEX idx_docs_tenant_mod ON docs(tenant_id ASC, modified_date DESC);
+-- ✅
+CREATE INDEX idx_docs_tenant_mod ON docs(tenant_id ASC, (yb_hash_code(id) % 3) ASC, modified_date DESC);
+```
+
+Updates count as writes here: changing `modified_date` moves the index entry to the hot end.
+`WHERE tenant_id = ? ORDER BY modified_date DESC LIMIT n` then merges N sorted streams (no Sort
+from v2025.2.1). With many tenants and even writes, no bucket is needed: the hot spots spread.
 See [low-cardinality.md](low-cardinality.md#why-range-sharding-works-here-the-hidden-pk-suffix).
 
 ### Choosing N

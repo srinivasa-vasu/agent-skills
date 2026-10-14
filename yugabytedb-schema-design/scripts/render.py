@@ -197,6 +197,19 @@ PHASE_LABEL = {"prepare": "prepare", "create": "create", "drop": "drop", "rewrit
                "manual": "manual (commented out in changes.sql)"}
 
 
+def current_section(data):
+    """The index definitions a finding is about, as they exist now (pg_get_indexdef: SPLIT clauses
+    are not included)."""
+    if data.get("redundant"):
+        return ["**Current:**\n", "```sql\n" + data["redundant"] + ";\n```\n",
+                "**Covered by:**\n", "```sql\n" + data["covered_by"] + ";\n```\n"]
+    if data.get("definition"):
+        return ["**Current:**\n", "```sql\n" + data["definition"] + ";\n```\n"]
+    if data.get("indexes"):
+        return ["**Current:**\n", "```sql\n" + "\n".join(d + ";" for d in data["indexes"]) + "\n```\n"]
+    return []
+
+
 def changes_section(actions):
     """One line per phase (with statement count and distinct notes), then the SQL, capped."""
     L = ["**Changes:**\n"]
@@ -253,17 +266,20 @@ def render_report(doc, findings, accepted_only):
              "commented out in changes.sql.\n")
     L.append("## Findings\n")
     for f in live:
-        tag = " ✔ accepted" if f.get("status") == "accepted" else ""
+        tag = " (accepted)" if f.get("status") == "accepted" else ""
         L.append(f"### {f['id']} [{f['severity']}] {f['title']} — `{f['object']}`{tag}\n")
         L.append(f"*Rule `{f['rule']}` · evidence: {f['evidence']} · confidence: {f['confidence']} · "
                  f"see `{f['reference']}`*\n")
         L.append(f"{f['detail']}\n\n**Recommendation:** {f['recommendation']}\n")
         if f.get("review_note"):
             L.append(f"**Review note:** {f['review_note']}\n")
+        L += current_section(f.get("data") or {})
         if f["actions"]:
             L += changes_section(f["actions"])
         if f["needs_confirmation"]:
-            L.append("Confirm: " + " ".join(f"☐ {q}" for q in f["needs_confirmation"]) + "\n")
+            L.append("**Confirm:**\n")
+            L += [f"- [ ] {q}" for q in f["needs_confirmation"]]
+            L.append("")
     if rejected:
         L.append("## Rejected in review (excluded from changes.sql)\n")
         L += [f"- {f['id']} {f['rule']} `{f['object']}`: {f.get('review_note') or 'no note'}" for f in rejected]

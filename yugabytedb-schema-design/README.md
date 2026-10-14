@@ -42,6 +42,9 @@ scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle [--sslrootcert
 # offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
 python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.md, changes.sql, rollback.sql
 
+# offline with only the DDL (ysql_dump --schema-only --include-yb-metadata, or a migration script)
+python3 scripts/analyze.py schema.sql  # -> review/ next to schema.sql
+
 # after triage (status / review_note / edited SQL in findings.json): re-render report + SQL
 python3 scripts/render.py bundle/review/findings.json
 
@@ -101,6 +104,7 @@ yugabytedb-schema-design/
     ├── export-usage.sql   # Per-node usage + pg_stat_statements -> usage/<node>.json
     ├── analyze.py         # Offline analyzer -> findings.json (+ render)
     ├── render.py          # findings.json -> report.md, changes.sql, rollback.sql
+    ├── schema_sql.py      # schema.sql -> catalog, for schema-only review
     └── checks/
         ├── hash_on_range_type.sql  # HASH key columns of date/time types
         └── redundant_indexes.sql   # Redundant (overshadowed) indexes

@@ -106,9 +106,35 @@ Rows are merged on `(dbid, userid, queryid)` and counters summed. If the file is
 consolidated across nodes, ship it as the only statements file so nothing is double-counted. When
 `usage/*.json` contains statements, statements files are ignored for the same reason.
 
-### Schema-only bundles (replay)
+### Schema-only review (only `schema.sql`)
 
-If the customer can only share `schema.sql`, replay it into a scratch cluster and export from there:
+When the customer can only share the DDL, point the analyzer at it. No database or cluster is
+needed: `scripts/schema_sql.py` parses the file into the same catalog `export-stats.sql` produces.
+
+```bash
+python3 scripts/analyze.py schema.sql                   # writes review/ next to schema.sql
+python3 scripts/analyze.py bundle/                      # a bundle with schema.sql and no stats.json
+python3 scripts/analyze.py schema.sql --range-default   # keys without HASH/ASC are range (see below)
+```
+
+- **Best input:** `ysql_dump --schema-only --include-yb-metadata`. It spells out HASH/ASC/DESC,
+  SPLIT clauses and colocation, so the review matches the live catalog. Tested: parsed dumps gave
+  the same findings and the same `changes.sql` as the live catalog of the same schema.
+- **Hand-written DDL / migration scripts** also work: inline `PRIMARY KEY` / `UNIQUE` /
+  `REFERENCES`, `SERIAL`, `SET search_path`, enums and domains. Keys without HASH/ASC get
+  YugabyteDB's default: first key column HASH, the rest ASC. If the cluster runs with
+  `yb_use_hash_splitting_by_default = off` (e.g. Enhanced PostgreSQL Compatibility), pass
+  `--range-default`. The report warns how many keys were assumed. Colocation and tablet counts are
+  only known where the DDL states them.
+- **What's lost without stats:** cardinality, NULL and skew checks (booleans and enums are still
+  caught from their types; HASH-led `smallint` keys become low-confidence candidates), row counts,
+  unused indexes and workload evidence. The report adds a `schema-only` info finding.
+- Views, functions, materialized views (and their indexes), grants and comments are skipped and
+  counted in the bundle warnings.
+
+**Higher fidelity: load into a scratch cluster.** When exact catalog details matter (expression
+types, operator classes, collations), or the DDL relies on extensions or features the parser
+doesn't model, load the file into an empty database and export from there:
 
 ```bash
 yugabyted start --base_dir=/tmp/yb-review
@@ -117,9 +143,6 @@ ysqlsh -d review -v ON_ERROR_STOP=1 -f schema.sql
 ysqlsh -d review -X -q -f scripts/export-stats.sql -o bundle/stats.json
 ```
 
-The dump spells out HASH/ASC/DESC and SPLIT clauses (`--include-yb-metadata`), so the replay matches
-the source's sharding regardless of `yb_use_hash_splitting_by_default`. With no statistics, the
-analyzer reports a `schema-only` info finding and uses only enum/boolean types for cardinality.
 Use the same YugabyteDB major version as the source.
 
 ---
@@ -205,7 +228,7 @@ re-review, a second run was a no-op, and `rollback.sql` restored the exact origi
 | `monotonic-range-key` | schema (identity, sequence, `now()` default, or timestamp-like name) | [hotspots.md](hotspots.md) |
 | `low-cardinality-hash` | stats (n_distinct ≤ 64) or schema (boolean/enum); a HASH-led `smallint` without stats is a low-confidence candidate. Replacement: `(col ASC)` + `SPLIT AT VALUES`, with an A1 bucket on a following monotonic column | [low-cardinality.md](low-cardinality.md) |
 | `null-heavy-hash`, `skewed-hash` | stats (null_frac, MCV freq) | [partial-indexes.md](partial-indexes.md) |
-| `range-hot-tails` | schema/stats: low-cardinality range column followed by a monotonic key or range PK suffix | [low-cardinality.md](low-cardinality.md) |
+| `range-hot-tails` | schema/stats: low-cardinality or skewed (one value ≥ 30% of rows) leading range column followed by a monotonic column (identity, sequence, `now()` default, or a created/modified/updated/`_date` name, snake_case or camelCase), or by a range PK suffix. Options bucket on the PK | [low-cardinality.md](low-cardinality.md) |
 | `range-single-tablet` | stats: range-sharded, 1 tablet, ≥ 100k rows | [low-cardinality.md](low-cardinality.md) |
 | `partial-keyed-on-predicate` | schema | [partial-indexes.md](partial-indexes.md) |
 | `partial-index-parameterized` | workload, **low confidence** (see limits) | [partial-indexes.md](partial-indexes.md) |
