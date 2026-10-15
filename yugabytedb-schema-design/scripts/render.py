@@ -18,7 +18,7 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 PHASES = [
@@ -193,6 +193,52 @@ def render_rollback(doc, findings, accepted_only):
     return "\n".join(L) + "\n"
 
 
+RULE_LABELS = {
+    "no-primary-key": "Tables without a primary key",
+    "invalid-index": "Invalid indexes",
+    "hash-on-range-type": "HASH-sharded date/time columns",
+    "monotonic-range-key": "Monotonic range keys (write hot spots)",
+    "low-cardinality-hash": "Low-cardinality HASH keys",
+    "null-heavy-hash": "NULL-heavy HASH columns",
+    "skewed-hash": "Skewed HASH columns",
+    "range-hot-tails": "Per-value write hot spots",
+    "range-single-tablet": "Range indexes on a single tablet",
+    "partial-keyed-on-predicate": "Partial indexes keyed on their predicate",
+    "partial-index-parameterized": "Partial indexes vs bind parameters",
+    "redundant-index": "Redundant indexes",
+    "unused-index": "Unused indexes",
+    "fk-without-index": "Foreign keys without an index",
+    "fk-type-mismatch": "Foreign key type mismatches",
+    "int-sequence": "INT sequence-backed columns",
+    "multi-column-gin": "Multi-column GIN indexes",
+    "scan-heavy-statement": "Scan-heavy statements",
+    "missing-statistics": "Missing optimizer statistics",
+    "schema-only": "Schema-only review",
+    "range-default": "Range sharding is the default",
+}
+
+
+def rule_label(rule):
+    return RULE_LABELS.get(rule, rule.replace("-", " ").capitalize())
+
+
+def group_findings(findings):
+    """[(rule, label, [findings])]: worst severity first, then larger groups. Finding order (and
+    IDs) inside a group is unchanged."""
+    groups = OrderedDict()
+    for f in findings:
+        groups.setdefault(f["rule"], []).append(f)
+    return [(r, rule_label(r), fs) for r, fs in sorted(
+        groups.items(), key=lambda kv: (min(SEV_ORDER[f["severity"]] for f in kv[1]), -len(kv[1]), rule_label(kv[0])))]
+
+
+def type_counts(fs):
+    c = defaultdict(int)
+    for f in fs:
+        c[f["severity"]] += 1
+    return c
+
+
 REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (report.html and changes.sql have all)
 PHASE_LABEL = {"prepare": "prepare", "create": "create", "drop": "drop", "rewrite": "rewrite",
                "manual": "manual (commented out in changes.sql)"}
@@ -242,6 +288,7 @@ def render_report(doc, findings, accepted_only):
     live = [f for f in findings if f.get("status") != "rejected"]
     rejected = [f for f in findings if f.get("status") == "rejected"]
     _, _, skipped = plan(findings, accepted_only)
+    prev_rule = None
     L = [f"# YugabyteDB schema review: {meta.get('database')}\n",
          f"- Exported: {meta.get('exported_at')}  \n- Version: {meta.get('version')}  ",
          f"- Nodes: {meta.get('node_count')} {meta.get('placements') or ''}  \n"
@@ -260,15 +307,25 @@ def render_report(doc, findings, accepted_only):
     L += [f"| {s} | {counts[s]} |" for s in SEV_ORDER if counts[s]]
     if rejected:
         L.append(f"| rejected in review | {len(rejected)} |")
+    if live:
+        L.append("\n### By finding type\n")
+        L.append("| Finding type | Total | high | medium | low | info |\n|---|---|---|---|---|---|")
+        for rule, label, fs in group_findings(live):
+            c = type_counts(fs)
+            L.append(f"| {label} (`{rule}`) | {len(fs)} | " + " | ".join(str(c[s] or "") for s in SEV_ORDER) + " |")
     L.append("\nEvidence: **schema** = from DDL (candidate), **stats** = backed by pg_stats/row counts, "
              "**workload** = backed by statements/usage.\n")
     L.append("Every change below is collected in **changes.sql** (run phase by phase) with its undo in "
              "**rollback.sql**. Phases: `prepare` → `create` → `drop` → `rewrite`; `manual` items are "
              "commented out in changes.sql.\n")
     L.append("## Findings\n")
-    for f in live:
+    for f in [f for _, _, fs in group_findings(live) for f in fs]:
+        if f["rule"] != prev_rule:
+            n = sum(1 for x in live if x["rule"] == f["rule"])
+            L.append(f"### {rule_label(f['rule'])} ({n})\n")
+        prev_rule = f["rule"]
         tag = " (accepted)" if f.get("status") == "accepted" else ""
-        L.append(f"### {f['id']} [{f['severity']}] {f['title']} — `{f['object']}`{tag}\n")
+        L.append(f"#### {f['id']} [{f['severity']}] {f['title']} — `{f['object']}`{tag}\n")
         L.append(f"*Rule `{f['rule']}` · evidence: {f['evidence']} · confidence: {f['confidence']} · "
                  f"see `{f['reference']}`*\n")
         L.append(f"{f['detail']}\n\n**Recommendation:** {f['recommendation']}\n")
@@ -367,6 +424,11 @@ ul.check { list-style: none; padding-left: 4px; } ul.check li::before { content:
 .warn li { margin: 3px 0; }
 .accepted { color: var(--low); font-size: 13px; font-weight: 600; }
 .hidden { display: none; }
+h4 { font-size: 16px; margin: 0; }
+h3.grph { font-size: 17px; margin: 28px 0 4px; } h3.grph .cnt { color: var(--muted); font-weight: 400; }
+tr.grp td { background: var(--card); font-weight: 600; padding-top: 10px; }
+tr.grp td .cnt { color: var(--muted); font-weight: 400; }
+.typetab td:nth-child(n+2), .typetab th:nth-child(n+2) { text-align: right; width: 70px; }
 footer { color: var(--muted); font-size: 13px; margin-top: 40px; }
 """
 
@@ -377,6 +439,15 @@ document.querySelectorAll('.card[data-sev]').forEach(function (c) {
     var sev = c.getAttribute('data-sev'), off = c.classList.contains('off');
     document.querySelectorAll('[data-sev="' + sev + '"]').forEach(function (el) {
       if (el !== c) el.classList.toggle('hidden', off);
+    });
+    // hide a finding-type group (and its index row) once all its findings are hidden
+    document.querySelectorAll('div.group').forEach(function (g) {
+      g.classList.toggle('hidden', g.querySelectorAll('section.finding:not(.hidden)').length === 0);
+    });
+    document.querySelectorAll('tr.grp').forEach(function (r) {
+      var k = r.getAttribute('data-grp');
+      r.classList.toggle('hidden',
+        document.querySelectorAll('tr[data-sev][data-grp="' + k + '"]:not(.hidden)').length === 0);
     });
   });
 });
@@ -440,6 +511,16 @@ def render_report_html(doc, findings, accepted_only):
              "<code>prepare</code> &rarr; <code>create</code> &rarr; <code>drop</code> &rarr; <code>rewrite</code>) "
              "with its undo in <b>rollback.sql</b>. <code>manual</code> items are commented out in changes.sql.</p>")
 
+    groups = group_findings(live)
+    if groups:
+        H.append('<h3 class="grph">By finding type</h3><table class="typetab"><tr><th>Finding type</th>'
+                 '<th>Total</th>' + "".join(f'<th><span class="sev {s}">{s}</span></th>' for s in SEV_ORDER) + "</tr>")
+        for rule, label, fs in groups:
+            c = type_counts(fs)
+            H.append(f'<tr><td><a href="#g-{rule}">{html.escape(label)}</a> <code>{rule}</code></td><td>{len(fs)}</td>'
+                     + "".join(f"<td>{c[s] or ''}</td>" for s in SEV_ORDER) + "</tr>")
+        H.append("</table>")
+
     if doc.get("warnings"):
         H.append('<h2>Bundle warnings</h2><ul class="warn">')
         H += [f"<li>{_h(w)}</li>" for w in doc["warnings"]]
@@ -448,19 +529,30 @@ def render_report_html(doc, findings, accepted_only):
     if live:
         H.append("<h2>Findings</h2><table><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Object</th>"
                  "<th>Evidence</th></tr>")
-        for f in live:
-            H.append(f'<tr data-sev="{f["severity"]}"><td><a href="#{f["id"]}">{f["id"]}</a></td>'
+        for rule, label, fs in groups:
+          H.append(f'<tr class="grp" data-grp="{rule}"><td colspan="5"><a href="#g-{rule}">{html.escape(label)}</a> '
+                   f'<span class="cnt">({len(fs)})</span></td></tr>')
+          for f in fs:
+            H.append(f'<tr data-sev="{f["severity"]}" data-grp="{rule}"><td><a href="#{f["id"]}">{f["id"]}</a></td>'
                      f'<td><span class="sev {f["severity"]}">{f["severity"]}</span></td>'
                      f'<td>{_h(f["title"])}</td><td><code>{html.escape(f["object"])}</code></td>'
                      f'<td>{f["evidence"]}</td></tr>')
         H.append("</table>")
 
-    for f in live:
+    prev_rule = None
+    for f in [f for _, _, fs in groups for f in fs]:
+        if f["rule"] != prev_rule:
+            if prev_rule is not None:
+                H.append("</div>")
+            prev_rule = f["rule"]
+            n = sum(1 for x in live if x["rule"] == f["rule"])
+            H.append(f'<div class="group" data-grp="{f["rule"]}"><h3 class="grph" id="g-{f["rule"]}">'
+                     f'{html.escape(rule_label(f["rule"]))} <span class="cnt">({n})</span></h3>')
         d = f.get("data") or {}
         H.append(f'<section class="finding {f["severity"]}" id="{f["id"]}" data-sev="{f["severity"]}">')
         acc = ' <span class="accepted">(accepted)</span>' if f.get("status") == "accepted" else ""
-        H.append(f'<h3><span class="sev {f["severity"]}">{f["severity"]}</span> {f["id"]} &middot; '
-                 f'{_h(f["title"])} <span class="obj">&mdash; <code>{html.escape(f["object"])}</code></span>{acc}</h3>')
+        H.append(f'<h4><span class="sev {f["severity"]}">{f["severity"]}</span> {f["id"]} &middot; '
+                 f'{_h(f["title"])} <span class="obj">&mdash; <code>{html.escape(f["object"])}</code></span>{acc}</h4>')
         H.append(f'<div class="sub">rule <code>{f["rule"]}</code> &middot; evidence: {f["evidence"]} &middot; '
                  f'confidence: {f["confidence"]} &middot; see <code>{html.escape(f["reference"])}</code></div>')
         H.append(f"<p>{_h(f['detail'])}</p><p><b>Recommendation:</b> {_h(f['recommendation'])}</p>")
@@ -493,6 +585,8 @@ def render_report_html(doc, findings, accepted_only):
             H += [f"<li>{_h(q)}</li>" for q in f["needs_confirmation"]]
             H.append("</ul>")
         H.append("</section>")
+    if groups:
+        H.append("</div>")
 
     if rejected:
         H.append("<h2>Rejected in review (excluded from changes.sql)</h2><ul>")
