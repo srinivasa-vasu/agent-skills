@@ -40,7 +40,8 @@ Review an existing database with read-only scripts and an offline analyzer:
 scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle [--sslrootcert ca.crt]
 
 # offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
-python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.md, changes.sql, rollback.sql
+python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.html, changes.sql, rollback.sql
+                                       #    --format md writes report.md instead of report.html
 
 # offline with only the DDL (ysql_dump --schema-only --include-yb-metadata, or a migration script)
 python3 scripts/analyze.py schema.sql  # -> review/ next to schema.sql
@@ -103,7 +104,7 @@ yugabytedb-schema-design/
     ├── export-stats.sql   # Catalog + pg_stats -> stats.json
     ├── export-usage.sql   # Per-node usage + pg_stat_statements -> usage/<node>.json
     ├── analyze.py         # Offline analyzer -> findings.json (+ render)
-    ├── render.py          # findings.json -> report.md, changes.sql, rollback.sql
+    ├── render.py          # findings.json -> report.html|md, changes.sql, rollback.sql
     ├── schema_sql.py      # schema.sql -> catalog, for schema-only review
     └── checks/
         ├── hash_on_range_type.sql  # HASH key columns of date/time types

@@ -26,6 +26,20 @@
 SET default_transaction_read_only = on;
 SET statement_timeout = '300s';
 
+-- pg_partman template tables (part_config.template_table): structure-only tables with no data
+-- and usually no PK. Exported so the analyzer can leave them out of the review.
+SELECT COALESCE((SELECT format('%I.part_config', n.nspname) FROM pg_extension e
+                 JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_partman'), '')
+       AS partman_cfg \gset
+SELECT CASE WHEN :'partman_cfg' <> '' THEN has_table_privilege(:'partman_cfg', 'SELECT') ELSE false END
+       AS has_partman \gset
+\if :has_partman
+SELECT COALESCE(jsonb_agg(template_table), '[]') AS partman_templates
+FROM :partman_cfg WHERE template_table IS NOT NULL \gset
+\else
+\set partman_templates '[]'
+\endif
+
 WITH
 rels AS (
   SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind, c.reltuples,
@@ -35,6 +49,9 @@ rels AS (
   WHERE c.relkind IN ('r', 'p', 'm')
     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     AND n.nspname !~ '^pg_(toast|temp_)'
+    -- objects that belong to an extension (e.g. pg_partman's part_config) are not the schema under review
+    AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
 ),
 idxs AS (
   SELECT ix.*, i.relname AS index_name, i.relkind AS index_relkind, i.relispartition AS index_is_partition,
@@ -54,6 +71,7 @@ SELECT jsonb_build_object(
     'values_mode',   :'values_mode',
     'node_count',    (SELECT count(*) FROM yb_servers()),
     'placements',    (SELECT jsonb_agg(DISTINCT cloud || '.' || region || '.' || zone) FROM yb_servers()),
+    'partman_templates', :'partman_templates'::jsonb,
     'settings',      (SELECT jsonb_object_agg(name, setting) FROM pg_settings
                       WHERE name IN ('server_version', 'yb_use_hash_splitting_by_default',
                                      'yb_enable_cbo', 'yb_enable_base_scans_cost_model',

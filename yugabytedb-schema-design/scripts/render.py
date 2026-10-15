@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Render a schema review from findings.json: report.md, changes.sql and rollback.sql.
+Render a schema review from findings.json: report.html (or report.md), changes.sql and rollback.sql.
 
 analyze.py calls this automatically. Run it again after triage so the SQL matches the final
 report. Set a finding's "status" to "rejected" (and "review_note" to why), or edit an action's
 "sql", then:
 
-    python3 render.py REVIEW_DIR/findings.json [--out DIR] [--accepted-only]
+    python3 render.py REVIEW_DIR/findings.json [--out DIR] [--accepted-only] [--format html|md]
 
 Status values: proposed (default) | accepted | rejected. --accepted-only drops "proposed" too.
 Stdlib only. Never connects to a database.
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -192,7 +193,7 @@ def render_rollback(doc, findings, accepted_only):
     return "\n".join(L) + "\n"
 
 
-REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (changes.sql has all)
+REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (report.html and changes.sql have all)
 PHASE_LABEL = {"prepare": "prepare", "create": "create", "drop": "drop", "rewrite": "rewrite",
                "manual": "manual (commented out in changes.sql)"}
 
@@ -315,10 +316,232 @@ def render_report(doc, findings, accepted_only):
     return "\n".join(L)
 
 
-def render_all(doc, out, accepted_only=False):
+# --------------------------------------------------------------------------- HTML report
+
+HTML_CSS = """
+:root { --bg:#fff; --fg:#1d2330; --muted:#5b6475; --line:#e3e6ec; --card:#f7f8fa; --code:#f1f3f6;
+        --high:#c62828; --medium:#e08a00; --low:#2e7d32; --info:#546e7a; --accent:#2f5bd3; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14171c; --fg:#e4e7ec; --muted:#9aa3b2; --line:#2a2f38; --card:#1b1f26; --code:#20252d;
+          --high:#ef5350; --medium:#ffa726; --low:#66bb6a; --info:#90a4ae; --accent:#7b9cff; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system, BlinkMacSystemFont,
+       "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 28px 24px 60px; }
+h1 { font-size: 26px; margin: 0 0 6px; } h2 { font-size: 20px; margin: 36px 0 12px; padding-bottom: 6px;
+     border-bottom: 1px solid var(--line); } h3 { font-size: 16px; margin: 0; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+code, pre { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code); padding: 12px 14px; border-radius: 6px; overflow: auto; max-height: 420px;
+      margin: 8px 0; white-space: pre; }
+pre code { background: none; padding: 0; }
+.meta { color: var(--muted); display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 2px 24px; margin: 10px 0 0; }
+.cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 4px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px;
+        min-width: 120px; cursor: pointer; user-select: none; }
+.card .n { font-size: 26px; font-weight: 700; } .card .l { color: var(--muted); font-size: 13px; }
+.card.off { opacity: .35; }
+.sev { display: inline-block; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+       color: #fff; border-radius: 4px; padding: 1px 7px; vertical-align: 2px; }
+.sev.high { background: var(--high); } .sev.medium { background: var(--medium); }
+.sev.low { background: var(--low); } .sev.info { background: var(--info); }
+.n.high { color: var(--high); } .n.medium { color: var(--medium); } .n.low { color: var(--low); }
+.n.info { color: var(--info); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.finding { background: var(--card); border: 1px solid var(--line); border-left: 5px solid var(--info);
+           border-radius: 8px; padding: 14px 18px; margin: 14px 0; }
+.finding.high { border-left-color: var(--high); } .finding.medium { border-left-color: var(--medium); }
+.finding.low { border-left-color: var(--low); }
+.finding .sub { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
+.finding .obj { font-weight: 400; }
+.label { font-weight: 600; margin: 12px 0 4px; }
+.phases { margin: 4px 0; padding-left: 20px; } .phases li { margin: 2px 0; }
+.ph { font: 12px ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; padding: 1px 6px; }
+details > summary { cursor: pointer; font-weight: 600; margin: 10px 0 4px; }
+ul.check { list-style: none; padding-left: 4px; } ul.check li::before { content: "[ ] "; color: var(--muted);
+           font-family: ui-monospace, Menlo, monospace; }
+.warn li { margin: 3px 0; }
+.accepted { color: var(--low); font-size: 13px; font-weight: 600; }
+.hidden { display: none; }
+footer { color: var(--muted); font-size: 13px; margin-top: 40px; }
+"""
+
+HTML_JS = """
+document.querySelectorAll('.card[data-sev]').forEach(function (c) {
+  c.addEventListener('click', function () {
+    c.classList.toggle('off');
+    var sev = c.getAttribute('data-sev'), off = c.classList.contains('off');
+    document.querySelectorAll('[data-sev="' + sev + '"]').forEach(function (el) {
+      if (el !== c) el.classList.toggle('hidden', off);
+    });
+  });
+});
+"""
+
+
+def _h(text):
+    """Escape, then render `code` spans."""
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", html.escape(str(text if text is not None else ""), quote=False))
+
+
+def _sql_lines(actions):
+    lines = []
+    for a in actions:
+        sql = "\n".join(line for line in a["sql"].splitlines()
+                        if not line.lstrip().startswith("\\") and not line.rstrip().endswith("\\gset"))
+        lines.append(comment_block(sql) if a["phase"] == "manual" else sql)
+    return "\n".join(lines)
+
+
+def short_version(v):
+    """'PostgreSQL 15.12-YB-2026.1.2.0-b0 on aarch64-...' -> 'YugabyteDB 2026.1.2.0-b0 (PG 15.12)'."""
+    m = re.search(r"PostgreSQL (\d+(?:\.\d+)*)-YB-(\S+)", v or "")
+    return f"YugabyteDB {m.group(2)} (PG {m.group(1)})" if m else (v or "unknown")
+
+
+def render_report_html(doc, findings, accepted_only):
+    meta = doc.get("meta", {})
+    live = [f for f in findings if f.get("status") != "rejected"]
+    rejected = [f for f in findings if f.get("status") == "rejected"]
+    _, _, skipped = plan(findings, accepted_only)
+    counts = defaultdict(int)
+    for f in live:
+        counts[f["severity"]] += 1
+    title = f"YugabyteDB schema review: {meta.get('database')}"
+    H = ["<!DOCTYPE html>", '<html lang="en"><head><meta charset="utf-8">',
+         '<meta name="viewport" content="width=device-width, initial-scale=1">',
+         f"<title>{html.escape(title)}</title><style>{HTML_CSS}</style></head><body><main>",
+         f"<h1>{html.escape(title)}</h1>", '<div class="meta">']
+    for k, v in (("Exported", meta.get("exported_at") or "n/a (schema.sql)"),
+                 ("Version", short_version(meta.get("version"))),
+                 ("Nodes", f"{meta.get('node_count') or 'n/a'} {' '.join(meta.get('placements') or [])}"),
+                 ("Tables / indexes", f"{doc.get('table_count')} / {doc.get('index_count')}"),
+                 ("Statements", f"{doc.get('statement_count', 0)} ({doc.get('statement_source') or 'none'})"),
+                 ("Usage files", doc.get("usage_file_count", 0))):
+        H.append(f"<div><b>{k}:</b> {html.escape(str(v))}</div>")
+    H.append("</div>")
+
+    H.append("<h2>Summary</h2><div class=\"cards\">")
+    for sev in SEV_ORDER:
+        if counts[sev]:
+            H.append(f'<div class="card" data-sev="{sev}" title="Click to show/hide">'
+                     f'<div class="n {sev}">{counts[sev]}</div><div class="l">{sev}</div></div>')
+    if rejected:
+        H.append(f'<div class="card"><div class="n">{len(rejected)}</div><div class="l">rejected in review</div></div>')
+    H.append("</div>")
+    H.append('<p class="sub">Click a severity to show or hide it. Evidence: <b>schema</b> = from DDL '
+             "(candidate), <b>stats</b> = backed by pg_stats/row counts, <b>workload</b> = backed by "
+             "statements/usage.</p>")
+    H.append("<p>Every change is collected in <b>changes.sql</b> (run phase by phase: "
+             "<code>prepare</code> &rarr; <code>create</code> &rarr; <code>drop</code> &rarr; <code>rewrite</code>) "
+             "with its undo in <b>rollback.sql</b>. <code>manual</code> items are commented out in changes.sql.</p>")
+
+    if doc.get("warnings"):
+        H.append('<h2>Bundle warnings</h2><ul class="warn">')
+        H += [f"<li>{_h(w)}</li>" for w in doc["warnings"]]
+        H.append("</ul>")
+
+    if live:
+        H.append("<h2>Findings</h2><table><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Object</th>"
+                 "<th>Evidence</th></tr>")
+        for f in live:
+            H.append(f'<tr data-sev="{f["severity"]}"><td><a href="#{f["id"]}">{f["id"]}</a></td>'
+                     f'<td><span class="sev {f["severity"]}">{f["severity"]}</span></td>'
+                     f'<td>{_h(f["title"])}</td><td><code>{html.escape(f["object"])}</code></td>'
+                     f'<td>{f["evidence"]}</td></tr>')
+        H.append("</table>")
+
+    for f in live:
+        d = f.get("data") or {}
+        H.append(f'<section class="finding {f["severity"]}" id="{f["id"]}" data-sev="{f["severity"]}">')
+        acc = ' <span class="accepted">(accepted)</span>' if f.get("status") == "accepted" else ""
+        H.append(f'<h3><span class="sev {f["severity"]}">{f["severity"]}</span> {f["id"]} &middot; '
+                 f'{_h(f["title"])} <span class="obj">&mdash; <code>{html.escape(f["object"])}</code></span>{acc}</h3>')
+        H.append(f'<div class="sub">rule <code>{f["rule"]}</code> &middot; evidence: {f["evidence"]} &middot; '
+                 f'confidence: {f["confidence"]} &middot; see <code>{html.escape(f["reference"])}</code></div>')
+        H.append(f"<p>{_h(f['detail'])}</p><p><b>Recommendation:</b> {_h(f['recommendation'])}</p>")
+        if f.get("review_note"):
+            H.append(f"<p><b>Review note:</b> {_h(f['review_note'])}</p>")
+        if d.get("redundant"):
+            H.append('<div class="label">Current</div><pre><code>' + html.escape(d["redundant"] + ";") + "</code></pre>")
+            H.append('<div class="label">Covered by</div><pre><code>' + html.escape(d["covered_by"] + ";") + "</code></pre>")
+        elif d.get("definition"):
+            H.append('<div class="label">Current</div><pre><code>' + html.escape(d["definition"] + ";") + "</code></pre>")
+        elif d.get("indexes"):
+            H.append('<div class="label">Current</div><pre><code>'
+                     + html.escape("\n".join(x + ";" for x in d["indexes"])) + "</code></pre>")
+        if f["actions"]:
+            H.append('<div class="label">Changes</div><ul class="phases">')
+            by_phase = defaultdict(list)
+            for a in f["actions"]:
+                by_phase[a["phase"]].append(a)
+            for p in ["prepare", "create", "drop", "rewrite", "manual"]:
+                acts = by_phase.get(p)
+                if acts:
+                    notes = list(dict.fromkeys(a["note"] for a in acts if a.get("note")))
+                    cnt = f" &times;{len(acts)}" if len(acts) > 1 else ""
+                    H.append(f'<li><span class="ph">{html.escape(PHASE_LABEL[p])}</span>{cnt}'
+                             + (f": {_h('; '.join(notes))}" if notes else "") + "</li>")
+            H.append('</ul><details open><summary>SQL</summary><pre><code>'
+                     + html.escape(_sql_lines(f["actions"])) + "</code></pre></details>")
+        if f["needs_confirmation"]:
+            H.append('<div class="label">Confirm</div><ul class="check">')
+            H += [f"<li>{_h(q)}</li>" for q in f["needs_confirmation"]]
+            H.append("</ul>")
+        H.append("</section>")
+
+    if rejected:
+        H.append("<h2>Rejected in review (excluded from changes.sql)</h2><ul>")
+        H += [f"<li>{f['id']} <code>{f['rule']}</code> <code>{html.escape(f['object'])}</code>: "
+              f"{_h(f.get('review_note') or 'no note')}</li>" for f in rejected]
+        H.append("</ul>")
+    if skipped:
+        H.append("<h2>Overlapping changes (emitted once)</h2><ul>")
+        H += [f"<li>{_h(x)}</li>" for x in skipped]
+        H.append("</ul>")
+    grouped = defaultdict(list)
+    for f in live:
+        for q in f["needs_confirmation"]:
+            grouped[q].append(f["id"])
+    if grouped:
+        H.append('<h2>Questions for the customer</h2><ul class="check">')
+        H += [f"<li>{_h(q)} <span class=\"sub\">({', '.join(ids)})</span></li>" for q, ids in grouped.items()]
+        H.append("</ul>")
+    if any(f["rule"] in ("redundant-index", "unused-index") for f in live):
+        H.append('<h2>Before dropping any index</h2><ul class="check">'
+                 "<li>No query hint (<code>pg_hint_plan</code> <code>IndexScan(t idx)</code>) or application code names it.</li>"
+                 "<li>Usage counters were collected on <b>every</b> node (they are per node) over a full business cycle.</li>"
+                 "<li>It doesn't back a constraint the application relies on (checked automatically for PK/UNIQUE/FK).</li>"
+                 "<li>Keep rollback.sql; drop one index at a time on busy systems and watch latency.</li></ul>")
+    top = doc.get("top_statements") or []
+    if top:
+        H.append(f"<h2>Top {len(top)} statements by total time</h2><table><tr><th>#</th><th>calls</th>"
+                 "<th>total ms</th><th>rows</th><th>DocDB rows scanned</th><th>nodes</th><th>query</th></tr>")
+        for n, st in enumerate(top, 1):
+            q = re.sub(r"\s+", " ", st["query"])[:300]
+            scanned = "" if st.get("docdb_rows_scanned") is None else format(st["docdb_rows_scanned"], ",")
+            H.append(f"<tr><td>{n}</td><td>{st['calls']:,}</td><td>{st['total_time_ms']:,.0f}</td>"
+                     f"<td>{st['rows']:,}</td><td>{scanned}</td><td>{len(st.get('nodes') or [])}</td>"
+                     f"<td><code>{html.escape(q)}</code></td></tr>")
+        H.append("</table>")
+    H.append("<footer>Generated by the yugabytedb-schema-design review (render.py). Nothing has been executed "
+             "against the database.</footer>")
+    H.append(f"</main><script>{HTML_JS}</script></body></html>")
+    return "\n".join(H)
+
+
+
+REPORT_FORMATS = {"html": ("report.html", render_report_html), "md": ("report.md", render_report)}
+
+
+def render_all(doc, out, accepted_only=False, fmt="html"):
     os.makedirs(out, exist_ok=True)
     findings = sorted(doc["findings"], key=lambda f: f["id"])
-    for name, fn in (("report.md", render_report), ("changes.sql", render_changes),
+    for name, fn in (REPORT_FORMATS[fmt], ("changes.sql", render_changes),
                      ("rollback.sql", render_rollback)):
         with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
             fh.write(fn(doc, findings, accepted_only))
@@ -331,15 +554,17 @@ def main():
     ap.add_argument("findings", help="findings.json written by analyze.py (possibly edited)")
     ap.add_argument("--out", help="output directory (default: next to findings.json)")
     ap.add_argument("--accepted-only", action="store_true", help="emit only findings with status accepted")
+    ap.add_argument("--format", choices=sorted(REPORT_FORMATS), default="html",
+                    help="report format: html (default, self-contained report.html) or md (report.md)")
     args = ap.parse_args()
     with open(args.findings, encoding="utf-8") as fh:
         doc = json.load(fh)
     if doc.get("format") != "yb-schema-review/findings/v1":
         sys.exit("not a yb-schema-review/findings/v1 file")
     out = args.out or os.path.dirname(os.path.abspath(args.findings))
-    phases, n_manual = render_all(doc, out, args.accepted_only)
+    phases, n_manual = render_all(doc, out, args.accepted_only, args.format)
     print(f"changes.sql: {', '.join(f'{p} {n}' for p, n in phases.items()) or 'no changes'}, "
-          f"{n_manual} manual → {out}/report.md, changes.sql, rollback.sql")
+          f"{n_manual} manual → {out}/{REPORT_FORMATS[args.format][0]}, changes.sql, rollback.sql")
 
 
 if __name__ == "__main__":

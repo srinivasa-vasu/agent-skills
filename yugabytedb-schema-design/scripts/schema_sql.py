@@ -707,6 +707,20 @@ def h_alter_table(cat, s):
     return True
 
 
+def h_alter_extension(cat, s):
+    """Binary-upgrade dumps recreate extension tables, then hand them to the extension:
+    ALTER EXTENSION pg_partman ADD TABLE partman.part_config. They aren't the schema under review."""
+    m = re.match(rf"^ALTER EXTENSION {IDENT} ADD (TABLE|SEQUENCE) ({QNAME})$", s, re.I)
+    if not m:
+        return False
+    key = cat.qname(m.group(2))
+    if m.group(1).upper() == "TABLE" and key in cat.tables:
+        cat.tables[key]["_extension"] = True
+    elif key in cat.sequences:
+        del cat.sequences[key]
+    return True
+
+
 def h_alter_index(cat, s):
     m = re.match(rf"^ALTER INDEX ({QNAME}) ATTACH PARTITION ({QNAME})$", s, re.I)
     if not m:
@@ -749,6 +763,13 @@ def set_owner(cat, seqkey, target):
 # --------------------------------------------------------------------------- assembly
 
 def finalize(cat):
+    ext = [k for k, t in cat.tables.items() if t.get("_extension")]
+    for k in ext:
+        t = cat.tables.pop(k)
+        cat.indexes = [i for i in cat.indexes if i["_table"] is not t]
+        cat.fks = [(ft, e) for ft, e in cat.fks if ft is not t]
+    if ext:
+        cat.skipped["extension-owned table (ALTER EXTENSION ... ADD TABLE)"] = len(ext)
     for t in cat.tables.values():
         colocated = bool(t.get("_colocated"))
         if t["_pk"]:
@@ -822,7 +843,8 @@ def parse(path, hash_default=True):
     v = re.search(r"--\s*Dumped from database version (\S+)", text)
     cat.version = v.group(1) if v else None
     is_dump = bool(re.search(r"--\s*(YSQL|PostgreSQL) database dump", text))
-    handlers = [h_set, h_enum, h_domain, h_create_table, h_create_index, h_alter_table, h_alter_index, h_sequence]
+    handlers = [h_set, h_enum, h_domain, h_create_table, h_create_index, h_alter_table, h_alter_extension,
+                h_alter_index, h_sequence]
     for s in split_statements(text):
         handled = False
         for h in handlers:
@@ -876,7 +898,7 @@ def main():
     ap.add_argument("schema", help="schema.sql (ysql_dump --schema-only --include-yb-metadata, or DDL)")
     ap.add_argument("-o", "--out", help="write the catalog JSON here (default: stdout)")
     ap.add_argument("--range-default", action="store_true",
-                    help="keys without HASH/ASC are range (yb_use_hash_splitting_by_default = off)")
+                    help="By default, keys without HASH/ASC/DESC follow YugabyteDB's default: the first key column is HASH, the rest ASC. Pass this to treat them as range (ASC) instead, for clusters running with yb_use_hash_splitting_by_default = off (e.g. Enhanced PostgreSQL Compatibility).")
     args = ap.parse_args()
     doc, warnings = parse(args.schema, hash_default=not args.range_default)
     text = json.dumps(doc, indent=2)

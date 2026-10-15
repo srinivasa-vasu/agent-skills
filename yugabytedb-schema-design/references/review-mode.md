@@ -6,7 +6,7 @@ same analyzer, so findings are identical and repeatable.
 
 ```
 live:     collect.sh ──┐
-offline:  customer ────┴──> bundle/ ──> analyze.py ──> findings.json ──> render.py ──> report.md
+offline:  customer ────┴──> bundle/ ──> analyze.py ──> findings.json ──> render.py ──> report.html
                                                           ▲                          changes.sql
                                                           └── you triage ────────────  rollback.sql
                                                               (status, review_note, edited SQL)
@@ -114,7 +114,7 @@ needed: `scripts/schema_sql.py` parses the file into the same catalog `export-st
 ```bash
 python3 scripts/analyze.py schema.sql                   # writes review/ next to schema.sql
 python3 scripts/analyze.py bundle/                      # a bundle with schema.sql and no stats.json
-python3 scripts/analyze.py schema.sql --range-default   # keys without HASH/ASC are range (see below)
+python3 scripts/analyze.py schema.sql --range-default   # override: keys without HASH/ASC are range (see below)
 ```
 
 - **Best input:** `ysql_dump --schema-only --include-yb-metadata`. It spells out HASH/ASC/DESC,
@@ -150,11 +150,12 @@ Use the same YugabyteDB major version as the source.
 ## Running the Analyzer
 
 ```bash
-python3 scripts/analyze.py bundle            # writes bundle/review/{findings.json,report.md,changes.sql,rollback.sql}
+python3 scripts/analyze.py bundle            # writes bundle/review/{findings.json,report.html,changes.sql,rollback.sql}
+python3 scripts/analyze.py bundle --format md   # report.md instead of report.html
 python3 scripts/analyze.py bundle --out out/
 ```
 
-Stdlib only (Python 3.8+). It never connects to a database. Run it with `python3 -I` when the
+Stdlib only (Python 3.8+). It never connects to a database. The report is `report.html` by default: one self-contained file (no external CSS/JS), with severity filters and collapsible SQL, that can be emailed as is. `--format md` writes `report.md`; `render.py` takes the same option. Run it with `python3 -I` when the
 bundle came from outside.
 
 For a quick live check without a bundle, run the standalone queries in `scripts/checks/`:
@@ -165,7 +166,7 @@ For a quick live check without a bundle, run the standalone queries in `scripts/
 
 ## Your Job After the Analyzer Runs
 
-The analyzer is deterministic. Your value is judgment. With `report.md` / `findings.json`:
+The analyzer is deterministic. Your value is judgment. With the report / `findings.json`:
 
 1. **Check the bundle warnings first.** Missing nodes, schema-only, other databases, `values_mode=all`.
    State what the review could and couldn't see.
@@ -187,7 +188,7 @@ The analyzer is deterministic. Your value is judgment. With `report.md` / `findi
    - Then: `python3 scripts/render.py bundle/review/findings.json`.
    Never hand-edit `changes.sql` alone: the next render overwrites it, and it drifts from the report.
 7. **Write the customer report**: summary, top 3–5 changes with impact and risk, the questions,
-   the rollout plan below. `report.md` already lists each finding's changes and their phase.
+   the rollout plan below. The report already lists each finding's changes and their phase.
 
 ### The generated SQL
 

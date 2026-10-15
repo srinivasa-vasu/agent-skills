@@ -2,12 +2,14 @@
 """
 Offline YugabyteDB schema review.
 
-Reads a review bundle and writes findings.json, report.md, changes.sql and rollback.sql
+Reads a review bundle and writes findings.json, report.html (or report.md), changes.sql and rollback.sql
 (the last three via render.py, which re-renders them after triage).
 Never connects to a database and never executes DDL. Python 3.8+, stdlib only.
 
-    python3 analyze.py BUNDLE_DIR [--out OUT_DIR]
-    python3 analyze.py schema.sql [--out OUT_DIR] [--range-default]     # schema only, no stats
+    python3 analyze.py BUNDLE_DIR [--out OUT_DIR] [--format html|md]
+    python3 analyze.py schema.sql [--out OUT_DIR]                    # schema only, no stats
+                                                                       # (keys without HASH/ASC: HASH first column)
+    python3 analyze.py schema.sql --range-default                    # same, but such keys are range (ASC)
 
 Bundle layout (stats.json or schema.sql is required):
 
@@ -238,6 +240,28 @@ def merge_statements(raw, dbid, warnings):
 
 # --------------------------------------------------------------------------- model
 
+def partman_templates(st):
+    """pg_partman template tables -> {table oid: reason}. They hold no data and normally have no
+    PK; the parent and its partitions carry the real definition. Listed by part_config (live
+    exports) or recognised by name: template_<parent schema>_<parent table> of a partitioned table."""
+    listed = set()
+    for name in st["meta"].get("partman_templates") or []:
+        parts = [p[1:-1].replace('""', '"') if p.startswith('"') else p
+                 for p in re.findall(r'"(?:[^"]|"")+"|[^."]+', name)]
+        if len(parts) == 2:
+            listed.add((parts[0], parts[1]))
+    parents = [(t["schema"], t["name"]) for t in st["tables"] if t["relkind"] == "p"]
+    out = {}
+    for t in st["tables"]:
+        if (t["schema"], t["name"]) in listed:
+            out[str(t["oid"])] = "pg_partman template table (part_config)"
+        elif t["relkind"] == "r" and t["name"].startswith("template_") and not t.get("is_partition"):
+            for ps, pn in parents:
+                if t["name"] == f"template_{ps}_{pn}"[:63]:
+                    out[str(t["oid"])] = f"pg_partman template table for {ps}.{pn}"
+    return out
+
+
 class Model:
     def __init__(self, bundle):
         st = bundle.stats
@@ -251,6 +275,11 @@ class Model:
             t["indexes"] = []
             t["pk"] = None
             self.tables[str(t["oid"])] = t
+        # pg_partman template tables are not part of the review (their indexes and FKs drop out too)
+        self.excluded = {}
+        for oid, reason in partman_templates(st).items():
+            t = self.tables.pop(oid)
+            self.excluded[t["fq"]] = reason
         self.indexes = []
         for i in st["indexes"]:
             t = self.tables.get(str(i["table_oid"]))
@@ -1269,6 +1298,9 @@ RULES = [rule_no_pk, rule_invalid, rule_hash_on_range_type, rule_monotonic_range
 
 def validate(b, m):
     w = list(b.warnings)
+    if m.excluded:
+        w.append(f"Excluded {len(m.excluded)} pg_partman template table(s) from the review (no data; "
+                 "the parent and partitions hold the real definition): " + ", ".join(sorted(m.excluded)) + ".")
     meta = m.meta
     if meta.get("values_mode") == "all":
         w.append("stats.json was exported with values_mode=all: it may contain customer data values.")
@@ -1290,7 +1322,7 @@ def load_render():
     return load_sibling("render")
 
 
-def write_outputs(out, b, m, findings, warnings):
+def write_outputs(out, b, m, findings, warnings, fmt="html"):
     os.makedirs(out, exist_ok=True)
     doc = {
         "format": "yb-schema-review/findings/v1", "meta": m.meta, "warnings": warnings,
@@ -1300,15 +1332,17 @@ def write_outputs(out, b, m, findings, warnings):
     }
     with open(os.path.join(out, "findings.json"), "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, default=str)
-    return load_render().render_all(json.loads(json.dumps(doc, default=str)), out)
+    return load_render().render_all(json.loads(json.dumps(doc, default=str)), out, fmt=fmt)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bundle", help="bundle directory (stats.json or schema.sql), or a schema.sql file")
     ap.add_argument("--out", help="output directory (default: BUNDLE/review)")
+    ap.add_argument("--format", choices=["html", "md"], default="html",
+                    help="report format: html (default, self-contained report.html) or md (report.md)")
     ap.add_argument("--range-default", action="store_true",
-                    help="schema.sql only: keys without HASH/ASC are range (yb_use_hash_splitting_by_default = off)")
+                    help="schema.sql only. By default, keys without HASH/ASC/DESC follow YugabyteDB's default: the first key column is HASH, the rest ASC. Pass this to treat them as range (ASC) instead, for clusters running with yb_use_hash_splitting_by_default = off (e.g. Enhanced PostgreSQL Compatibility).")
     args = ap.parse_args()
     b = Bundle(args.bundle, range_default=args.range_default)
     m = Model(b)
@@ -1316,20 +1350,20 @@ def main():
     for rule in RULES:
         rule(m, F)
     findings = F.sorted()
-    # every finding about an existing index carries its current definition (shown in report.md)
+    # every finding about an existing index carries its current definition (shown in the report)
     defs = {i["fq"]: i["definition"] for i in m.indexes}
     for f in findings:
         if f["object"] in defs and "redundant" not in f["data"]:
             f["data"].setdefault("definition", defs[f["object"]])
     warnings = validate(b, m)
     out = args.out or os.path.join(b.path, "review")
-    phases, n_manual = write_outputs(out, b, m, findings, warnings)
+    phases, n_manual = write_outputs(out, b, m, findings, warnings, args.format)
     counts = defaultdict(int)
     for f in findings:
         counts[f["severity"]] += 1
     print(f"{len(findings)} findings ({', '.join(f'{v} {k}' for k, v in sorted(counts.items(), key=lambda x: SEV_ORDER[x[0]]))})")
     print(f"changes.sql: {', '.join(f'{p} {n}' for p, n in phases.items()) or 'no changes'}, {n_manual} manual")
-    print(f"→ {out}/report.md, findings.json, changes.sql, rollback.sql")
+    print(f"→ {out}/report.{args.format}, findings.json, changes.sql, rollback.sql")
     for x in warnings:
         print(f"warning: {x}", file=sys.stderr)
 
