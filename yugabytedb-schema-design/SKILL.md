@@ -27,7 +27,12 @@ This skill covers **how to design schemas well** for YugabyteDB: the design patt
   `references/review-mode.md` first. It covers the bundle, safety rules, the scripts, how to triage
   the analyzer's findings, and the rollout runbook. Never run DDL or `ANALYZE` against the user's
   database. Changes go into `changes.sql` (phased, with `rollback.sql`), rendered from the
-  triaged `findings.json` so the SQL always matches the report.
+  triaged `findings.json` so the SQL always matches the report. With statements
+  (`pg_stat_statements` or tserver `:13000/statements`), the analyzer also checks each query's
+  conditions against the PK and indexes, weighted by calls and mean time; its proposed indexes go
+  in the runnable `workload` phase. A statements file spanning several databases needs
+  `--database NAME`. Every change is checked against the end state: no proposal duplicates an
+  existing index, a reshaped primary key, or another proposal.
 
 ## Core Concepts (Read First)
 
@@ -55,7 +60,7 @@ Read only the section(s) relevant to the user's question:
 
 - `scripts/collect.sh` — read-only collector: schema dump, `stats.json`, per-node `usage/*.json` (TLS: `--sslrootcert`)
 - `scripts/export-stats.sql` / `scripts/export-usage.sql` — the exports, runnable by hand with `ysqlsh`
-- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle or `schema.sql` → `findings.json`, `report.html` (`--format md` for `report.md`), `changes.sql`, `rollback.sql`
+- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle or `schema.sql` → `findings.json`, `report.html` (`--format md` for `report.md`), `changes.sql`, `rollback.sql`; `--database NAME` keeps one database's statements
 - `scripts/schema_sql.py` — parses `schema.sql` (ysql_dump or hand-written DDL) into the catalog, for schema-only review (`analyze.py schema.sql`)
 - `scripts/render.py` — re-renders the report / `changes.sql` / `rollback.sql` from a triaged `findings.json`
 - `scripts/checks/*.sql` — standalone live checks: `hash_on_range_type.sql`, `redundant_indexes.sql`
@@ -75,6 +80,7 @@ Read only the section(s) relevant to the user's question:
 | "Can you optimize this schema?" | `Refer all the files for the optimal design` |
 | "Review / audit my database", "here is my schema dump / stats / statements.json" | `review-mode.md`, then the files each finding cites |
 | "Which indexes are redundant / unused?" | `review-mode.md` + `index-design.md` |
+| "Which queries lack an index?", pg_stat_statements + schema dump | `review-mode.md` (statement access checks) + `index-design.md` |
 
 ## Golden Rules at a Glance
 
@@ -83,10 +89,14 @@ Read only the section(s) relevant to the user's question:
 ✅ Write HASH / ASC / DESC explicitly — the default depends on yb_use_hash_splitting_by_default
 ✅ Use ASC/DESC on index columns that are range-queried (pre-split new range indexes)
 ✅ Order index columns Equality → Sort → Range; a HASH leading column must be high-cardinality
+✅ Lead with a low-cardinality or skewed column (few tenants) as range (ASC), not HASH: it splits inside a value; check pg_stats, else follow the schema's existing pattern
+✅ INCLUDE the primary key columns a query selects: the PK in an index entry is encoded and not readable
 ✅ Index every foreign key column in child tables (a PK whose leading column is the FK counts)
 ✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate
 ✅ Match FK column types exactly (INT vs BIGINT matters)
 ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
+✅ Keep one copy of a key: a range index on exactly the HASH PK's columns ((tenant_id, id) HASH + (tenant_id ASC, id ASC)) doubles every write; reshape the PK (leading column by stats, else the existing pattern) and drop the index, or drop the index if every query binds the full key
+✅ When a new index covers an existing one (same HASH part, old key a prefix), drop the old one after the new one is built
 ✅ Use TEXT wherever possible instead of VARCHAR(n) (no performance benefit; use a CHECK constraint if a limit is needed)
 
 ❌ Never use a low-cardinality column (boolean, enum, smallint code) as the only HASH column

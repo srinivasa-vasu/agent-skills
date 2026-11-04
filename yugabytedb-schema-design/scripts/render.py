@@ -24,9 +24,18 @@ SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 PHASES = [
     ("prepare", "Prepare: refresh optimizer statistics"),
     ("create", "Create: new and replacement indexes (built online, outside a transaction block)"),
+    ("workload", "Workload: indexes proposed from statement text (built online; review each one)"),
     ("drop", "Drop: redundant indexes, then swap replacements in under the original names"),
     ("rewrite", "Rewrite: primary key / column type changes. FULL TABLE REWRITES"),
 ]
+WORKLOAD_NOTE = """\
+-- These indexes come from the statements in pg_stat_statements, not from the catalog alone. Each is
+-- independent of the others and of the other phases. Before running this phase, for each index:
+--   1. EXPLAIN (ANALYZE, DIST) the statements listed under it on staging, with real parameters,
+--      after creating it: the plan should use it and read fewer rows.
+--   2. Weigh the write cost: every index adds work to each INSERT/UPDATE/DELETE on the table.
+-- To skip one, set its finding's "status" to "rejected" in findings.json and re-render
+-- (python3 render.py findings.json); don't edit this file by hand. Undo: rollback.sql phase=workload."""
 REWRITE_WARNING = """\
 -- !! Each statement below rewrites a whole table. Run in a maintenance window with application
 -- !! writes stopped: concurrent DML during a YSQL table rewrite is not safe
@@ -42,7 +51,8 @@ def plan(findings, accepted_only):
     """Pick the actions to emit, resolving overlaps between findings.
 
     Returns (by_phase, manual, skipped): lists of (finding, action) plus skip notes."""
-    active = [f for f in findings if included(f, accepted_only)]
+    # most severe first inside every phase; a stable sort keeps a finding's own actions in order
+    active = sorted((f for f in findings if included(f, accepted_only)), key=lambda f: SEV_ORDER[f["severity"]])
     # indexes dropped outright: replacements of them are pointless
     dropped = {a["target"]: f["id"] for f in active for a in f["actions"]
                if a["kind"] == "drop" and a["phase"] == "drop"}
@@ -135,6 +145,22 @@ def action_comment(f, a):
     return line
 
 
+MANUAL_NOTE = """\
+-- Each item needs a decision this review can't make: a placeholder to fill (<column>), a choice
+-- between options, a uniqueness rule to keep, or a drop to confirm. Read the finding in the report,
+-- answer its "decide" questions, then copy the statement to a session and run it by hand."""
+
+
+def statement_comments(f):
+    """Up to three of the statements behind a workload index, as comment lines."""
+    out = []
+    for s in (f.get("data") or {}).get("statements", [])[:3]:
+        if isinstance(s, dict) and "calls" in s:
+            mean = s.get("mean_ms", s["total_time_ms"] / max(s["calls"], 1))
+            out.append(f"--   serves ({s['calls']:,} calls, mean {mean:,.1f} ms): {short_query(s['query'], 110)}")
+    return out
+
+
 def render_changes(doc, findings, accepted_only):
     by_phase, manual, skipped = plan(findings, accepted_only)
     phase_names = [p for p, _ in PHASES]
@@ -144,24 +170,37 @@ def render_changes(doc, findings, accepted_only):
     for p, title in PHASES:
         n = len(by_phase.get(p, []))
         L.append(f"--   ysqlsh -v phase={p:<8} -f changes.sql   {n:>3} change(s)  {title.split(':')[0]}")
-    L += ["-- \"Manual decisions\" at the end are commented out: edit and run them by hand.",
+    L += ["-- Inside each phase, changes run most severe first: high, then medium, then low.",
+          "-- workload: indexes proposed from statement text. Runnable; review each one first (see the phase).",
+          "-- \"Manual decisions\" at the end are commented out: each needs a decision; run them by hand.",
           "-- Undo with rollback.sql, phase by phase in reverse order.", ""]
-    L += gate(phase_names, "ysqlsh -v phase=prepare|create|drop|rewrite -f changes.sql")
+    L += gate(phase_names, "ysqlsh -v phase=prepare|create|workload|drop|rewrite -f changes.sql")
     for p, title in PHASES:
         L += ["", f"-- {'=' * 96}", f"-- {title}", f"-- {'=' * 96}"]
         if p == "rewrite":
             L.append(REWRITE_WARNING)
+        if p == "workload":
+            L.append(WORKLOAD_NOTE)
         L.append(f"\\if :run_{p}")
         items = by_phase.get(p, [])
         if not items:
             L.append("-- (nothing)")
+        sev = None
         for f, a in items:
-            L += ["", action_comment(f, a), a["sql"]]
+            if f["severity"] != sev:
+                sev = f["severity"]
+                L += ["", f"-- ---- {sev} " + "-" * (90 - len(sev))]
+            L += ["", action_comment(f, a)] + statement_comments(f) + [a["sql"]]
         L += ["", f"\\echo 'phase {p}: done'", "\\endif"]
     L += ["", f"-- {'=' * 96}", "-- Manual decisions (commented out; need a choice or confirmation first)",
-          f"-- {'=' * 96}"]
+          f"-- {'=' * 96}", MANUAL_NOTE]
+    sev = None
     for f, a in manual:
-        L += ["", action_comment(f, a), comment_block(a["sql"])]
+        if f["severity"] != sev:
+            sev = f["severity"]
+            L += ["", f"-- ---- {sev} " + "-" * (90 - len(sev))]
+        L += ["", action_comment(f, a)] + [f"--   decide: {q}" for q in f.get("needs_confirmation") or []]
+        L.append(comment_block(a["sql"]))
     if skipped:
         L += ["", "-- Skipped as overlapping:"] + [f"--   {s}" for s in skipped]
     return "\n".join(L) + "\n"
@@ -169,7 +208,7 @@ def render_changes(doc, findings, accepted_only):
 
 def render_rollback(doc, findings, accepted_only):
     by_phase, _, _ = plan(findings, accepted_only)
-    order = ["rewrite", "drop", "create"]
+    order = ["rewrite", "drop", "workload", "create"]
     L = header_lines(doc, findings, accepted_only, "rollback")
     L += ["--",
           "-- Undo changes.sql phase by phase, in this order:"]
@@ -177,7 +216,7 @@ def render_rollback(doc, findings, accepted_only):
         L.append(f"--   ysqlsh -v phase={p:<8} -f rollback.sql")
     L += ["-- Recreated indexes come from pg_get_indexdef, which omits SPLIT AT/INTO clauses: re-add them",
           "-- from schema.sql (ysql_dump --include-yb-metadata) for range-sharded indexes.", ""]
-    L += gate(order, "ysqlsh -v phase=rewrite|drop|create -f rollback.sql")
+    L += gate(order, "ysqlsh -v phase=rewrite|drop|workload|create -f rollback.sql")
     for p in order:
         title = dict(PHASES)[p]
         L += ["", f"-- {'=' * 96}", f"-- Undo {title[0].lower() + title[1:]}", f"-- {'=' * 96}"]
@@ -206,12 +245,17 @@ RULE_LABELS = {
     "partial-keyed-on-predicate": "Partial indexes keyed on their predicate",
     "partial-index-parameterized": "Partial indexes vs bind parameters",
     "redundant-index": "Redundant indexes",
+    "pk-range-twin": "Indexes repeating the primary key with range sharding",
     "unused-index": "Unused indexes",
     "fk-without-index": "Foreign keys without an index",
     "fk-type-mismatch": "Foreign key type mismatches",
     "int-sequence": "INT sequence-backed columns",
     "multi-column-gin": "Multi-column GIN indexes",
     "scan-heavy-statement": "Scan-heavy statements",
+    "statement-no-index": "Statements without a usable index",
+    "hash-key-partly-bound": "Statements binding part of a HASH key",
+    "range-on-hash-column": "Range filters or sorts on HASH columns",
+    "statement-weak-index": "Indexes serving part of a filter",
     "missing-statistics": "Missing optimizer statistics",
     "schema-only": "Schema-only review",
     "range-default": "Range sharding is the default",
@@ -240,7 +284,8 @@ def type_counts(fs):
 
 
 REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (report.html and changes.sql have all)
-PHASE_LABEL = {"prepare": "prepare", "create": "create", "drop": "drop", "rewrite": "rewrite",
+PHASE_LABEL = {"prepare": "prepare", "create": "create", "workload": "workload (review each)", "drop": "drop",
+               "rewrite": "rewrite",
                "manual": "manual (commented out in changes.sql)"}
 
 
@@ -257,13 +302,36 @@ def current_section(data):
     return []
 
 
+def short_query(q, n):
+    q = re.sub(r"\s+", " ", q).strip()
+    return q if len(q) <= n else q[:n - 1].rstrip() + "…"
+
+
+def statement_rows(data):
+    """[(calls, total ms, mean ms, share, query)] for findings backed by statements."""
+    return [(s["calls"], s["total_time_ms"], s.get("mean_ms", s["total_time_ms"] / max(s["calls"], 1)),
+             s.get("share"), re.sub(r"\s+", " ", s["query"])) for s in data.get("statements") or []
+            if isinstance(s, dict) and "calls" in s]
+
+
+def statements_section(data):
+    rows = statement_rows(data)
+    if not rows:
+        return []
+    L = ["**Statements:**\n", "| calls | total ms | mean ms | share | query |", "|---|---|---|---|---|"]
+    for calls, tot, mean, share, q in rows:
+        sh = "" if share is None else f"{share:.1%}"
+        L.append(f"| {calls:,} | {tot:,.0f} | {mean:,.1f} | {sh} | `{short_query(q, 160).replace('|', chr(92) + '|')}` |")
+    return L + [""]
+
+
 def changes_section(actions):
     """One line per phase (with statement count and distinct notes), then the SQL, capped."""
     L = ["**Changes:**\n"]
     by_phase = defaultdict(list)
     for a in actions:
         by_phase[a["phase"]].append(a)
-    for p in ["prepare", "create", "drop", "rewrite", "manual"]:
+    for p in ["prepare", "create", "workload", "drop", "rewrite", "manual"]:
         acts = by_phase.get(p)
         if not acts:
             continue
@@ -316,8 +384,9 @@ def render_report(doc, findings, accepted_only):
     L.append("\nEvidence: **schema** = from DDL (candidate), **stats** = backed by pg_stats/row counts, "
              "**workload** = backed by statements/usage.\n")
     L.append("Every change below is collected in **changes.sql** (run phase by phase) with its undo in "
-             "**rollback.sql**. Phases: `prepare` → `create` → `drop` → `rewrite`; `manual` items are "
-             "commented out in changes.sql.\n")
+             "**rollback.sql**. Phases: `prepare` → `create` → `workload` → `drop` → `rewrite`. `workload` "
+             "holds the indexes proposed from statement text: runnable, but review each one first. Only "
+             "`manual` items, which need a decision or a placeholder filled, are commented out.\n")
     L.append("## Findings\n")
     for f in [f for _, _, fs in group_findings(live) for f in fs]:
         if f["rule"] != prev_rule:
@@ -332,6 +401,7 @@ def render_report(doc, findings, accepted_only):
         if f.get("review_note"):
             L.append(f"**Review note:** {f['review_note']}\n")
         L += current_section(f.get("data") or {})
+        L += statements_section(f.get("data") or {})
         if f["actions"]:
             L += changes_section(f["actions"])
         if f["needs_confirmation"]:
@@ -363,11 +433,13 @@ def render_report(doc, findings, accepted_only):
     top = doc.get("top_statements") or []
     if top:
         L.append(f"## Top {len(top)} statements by total time\n")
-        L.append("| # | calls | total ms | rows | DocDB rows scanned | nodes | query |\n|---|---|---|---|---|---|---|")
+        L.append("| # | calls | total ms | mean ms | rows | DocDB rows scanned | nodes | query |\n"
+                 "|---|---|---|---|---|---|---|---|")
         for n, s in enumerate(top, 1):
             q = re.sub(r"\s+", " ", s["query"])[:120].replace("|", "\\|")
             scanned = "" if s.get("docdb_rows_scanned") is None else format(s["docdb_rows_scanned"], ",")
-            L.append(f"| {n} | {s['calls']:,} | {s['total_time_ms']:,.0f} | {s['rows']:,} | {scanned} | "
+            L.append(f"| {n} | {s['calls']:,} | {s['total_time_ms']:,.0f} | "
+                     f"{s['total_time_ms'] / max(s['calls'], 1):,.1f} | {s['rows']:,} | {scanned} | "
                      f"{len(s.get('nodes') or [])} | `{q}` |")
         L.append("")
     return "\n".join(L)
@@ -409,6 +481,10 @@ pre code { background: none; padding: 0; }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 600; }
+table.stmts th, table.stmts td.n { white-space: nowrap; }
+table.stmts td.n { text-align: right; }
+table.stmts td.q { width: 100%; }
+table.stmts td.q code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; padding: 4px 8px; }
 .finding { background: var(--card); border: 1px solid var(--line); border-left: 5px solid var(--info);
            border-radius: 8px; padding: 14px 18px; margin: 14px 0; }
 .finding.high { border-left-color: var(--high); } .finding.medium { border-left-color: var(--medium); }
@@ -508,8 +584,10 @@ def render_report_html(doc, findings, accepted_only):
              "(candidate), <b>stats</b> = backed by pg_stats/row counts, <b>workload</b> = backed by "
              "statements/usage.</p>")
     H.append("<p>Every change is collected in <b>changes.sql</b> (run phase by phase: "
-             "<code>prepare</code> &rarr; <code>create</code> &rarr; <code>drop</code> &rarr; <code>rewrite</code>) "
-             "with its undo in <b>rollback.sql</b>. <code>manual</code> items are commented out in changes.sql.</p>")
+             "<code>prepare</code> &rarr; <code>create</code> &rarr; <code>workload</code> &rarr; <code>drop</code> "
+             "&rarr; <code>rewrite</code>) with its undo in <b>rollback.sql</b>. <code>workload</code> holds the "
+             "indexes proposed from statement text: runnable, but review each one first. Only <code>manual</code> "
+             "items, which need a decision or a placeholder filled, are commented out.</p>")
 
     groups = group_findings(live)
     if groups:
@@ -566,12 +644,21 @@ def render_report_html(doc, findings, accepted_only):
         elif d.get("indexes"):
             H.append('<div class="label">Current</div><pre><code>'
                      + html.escape("\n".join(x + ";" for x in d["indexes"])) + "</code></pre>")
+        rows = statement_rows(d)
+        if rows:
+            H.append('<div class="label">Statements</div><table class="stmts"><tr><th>calls</th><th>total ms</th>'
+                     '<th>mean ms</th><th>share</th><th>query</th></tr>')
+            for calls, tot, mean, share, q in rows:
+                sh = "" if share is None else f"{share:.1%}"
+                H.append(f'<tr><td class="n">{calls:,}</td><td class="n">{tot:,.0f}</td><td class="n">{mean:,.1f}</td>'
+                         f'<td class="n">{sh}</td><td class="q"><code>{html.escape(short_query(q, 300))}</code></td></tr>')
+            H.append("</table>")
         if f["actions"]:
             H.append('<div class="label">Changes</div><ul class="phases">')
             by_phase = defaultdict(list)
             for a in f["actions"]:
                 by_phase[a["phase"]].append(a)
-            for p in ["prepare", "create", "drop", "rewrite", "manual"]:
+            for p in ["prepare", "create", "workload", "drop", "rewrite", "manual"]:
                 acts = by_phase.get(p)
                 if acts:
                     notes = list(dict.fromkeys(a["note"] for a in acts if a.get("note")))
@@ -613,14 +700,17 @@ def render_report_html(doc, findings, accepted_only):
                  "<li>Keep rollback.sql; drop one index at a time on busy systems and watch latency.</li></ul>")
     top = doc.get("top_statements") or []
     if top:
-        H.append(f"<h2>Top {len(top)} statements by total time</h2><table><tr><th>#</th><th>calls</th>"
-                 "<th>total ms</th><th>rows</th><th>DocDB rows scanned</th><th>nodes</th><th>query</th></tr>")
+        H.append(f"<h2>Top {len(top)} statements by total time</h2><table class=\"stmts\"><tr><th>#</th><th>calls</th>"
+                 "<th>total ms</th><th>mean ms</th><th>rows</th><th>DocDB rows scanned</th><th>nodes</th><th>query</th></tr>")
         for n, st in enumerate(top, 1):
-            q = re.sub(r"\s+", " ", st["query"])[:300]
+            q = short_query(st["query"], 300)
             scanned = "" if st.get("docdb_rows_scanned") is None else format(st["docdb_rows_scanned"], ",")
-            H.append(f"<tr><td>{n}</td><td>{st['calls']:,}</td><td>{st['total_time_ms']:,.0f}</td>"
-                     f"<td>{st['rows']:,}</td><td>{scanned}</td><td>{len(st.get('nodes') or [])}</td>"
-                     f"<td><code>{html.escape(q)}</code></td></tr>")
+            H.append(f'<tr><td class="n">{n}</td><td class="n">{st["calls"]:,}</td>'
+                     f'<td class="n">{st["total_time_ms"]:,.0f}</td>'
+                     f'<td class="n">{st["total_time_ms"] / max(st["calls"], 1):,.1f}</td>'
+                     f'<td class="n">{st["rows"]:,}</td><td class="n">{scanned}</td>'
+                     f'<td class="n">{len(st.get("nodes") or [])}</td>'
+                     f'<td class="q"><code>{html.escape(q)}</code></td></tr>')
         H.append("</table>")
     H.append("<footer>Generated by the yugabytedb-schema-design review (render.py). Nothing has been executed "
              "against the database.</footer>")

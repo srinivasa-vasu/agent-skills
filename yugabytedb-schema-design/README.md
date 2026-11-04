@@ -41,6 +41,7 @@ scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle [--sslrootcert
 
 # offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
 python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.html, changes.sql, rollback.sql
+python3 scripts/analyze.py bundle --database appdb   # statements file covering several databases
                                        #    --format md writes report.md instead of report.html
 
 # offline with only the DDL (ysql_dump --schema-only --include-yb-metadata, or a migration script)
@@ -50,15 +51,17 @@ python3 scripts/analyze.py schema.sql  # -> review/ next to schema.sql
 python3 scripts/render.py bundle/review/findings.json
 
 # apply one phase at a time
-ysqlsh -d <db> -v phase=create -f bundle/review/changes.sql   # prepare | create | drop | rewrite
+ysqlsh -d <db> -v phase=create -f bundle/review/changes.sql   # prepare | create | workload | drop | rewrite
 ```
 
-Checks include HASH-sharded date/time key columns, redundant and unused indexes, low-cardinality,
-NULL-heavy or skewed HASH keys, monotonic range keys, per-value write tails, single-tablet range
-indexes, partial-index pitfalls, missing or mistyped FK indexes, tables without a PK, and
-scan-heavy statements. Each finding carries an evidence level (schema / stats / workload). The
+Checks include HASH-sharded date/time key columns, redundant and unused indexes, range "twins" of a
+HASH primary key, low-cardinality, NULL-heavy or skewed HASH keys, monotonic range keys, per-value write tails, single-tablet range
+indexes, partial-index pitfalls, missing or mistyped FK indexes, tables without a PK,
+scan-heavy statements, and statements whose filters no index serves (no leading index column,
+part of a HASH key bound, range or sort on a HASH column, or a partly used index), weighted by
+calls, total and mean time. Each finding carries an evidence level (schema / stats / workload). The
 analyzer never runs DDL. Every change in the report is written to `changes.sql` (phased:
-prepare → create → drop → rewrite, idempotent) with a matching `rollback.sql`. See
+prepare → create → workload → drop → rewrite, idempotent) with a matching `rollback.sql`. See
 [`review-mode.md`](references/review-mode.md) for the customer-side commands, schema-only replay,
 the accepted statements formats, and the rollout runbook.
 
@@ -70,10 +73,14 @@ the accepted statements formats, and the rollout runbook.
 - ✅ Write `HASH` / `ASC` / `DESC` explicitly — the default depends on `yb_use_hash_splitting_by_default`
 - ✅ Use `ASC`/`DESC` on index columns that are range-queried (pre-split new range indexes)
 - ✅ Order index columns Equality → Sort → Range; a `HASH` leading column must be high-cardinality
+- ✅ Lead with a low-cardinality or skewed column (few tenants) as range (`ASC`), not `HASH`: it splits inside a value; check `pg_stats`, else follow the schema's existing pattern
+- ✅ `INCLUDE` the primary key columns a query selects: the PK in an index entry is encoded and not readable
 - ✅ Index every foreign key column in child tables (a PK whose leading column is the FK counts)
 - ✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate
 - ✅ Match FK column types exactly (`INT` vs `BIGINT` matters)
 - ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
+- ✅ Keep one copy of a key: a range index on exactly the HASH PK's columns (`(tenant_id, id) HASH` + `(tenant_id ASC, id ASC)`) doubles every write; reshape the PK (leading column by stats, else the existing pattern) and drop the index, or drop the index if every query binds the full key
+- ✅ When a new index covers an existing one (same HASH part, old key a prefix), drop the old one after the new one is built
 - ✅ Use `TEXT` wherever possible instead of `VARCHAR(n)` (no performance benefit; use a `CHECK` constraint if a limit is needed)
 
 ### Don't

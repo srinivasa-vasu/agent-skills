@@ -27,10 +27,34 @@ CREATE INDEX idx_orders_customer ON orders(
 2. Then columns used in `ORDER BY` (so rows come back pre-sorted, enabling `LIMIT` push-down)
 3. Then columns filtered with `<`, `>`, `BETWEEN`
 
+With `ORDER BY ... LIMIT`, a range column placed after the sort column can't be used to seek, so put
+it in `INCLUDE` (it is still filtered inside the index) rather than in the key. Placing it before
+the sort column seeks on it but returns rows in its order: every match is read and sorted before
+`LIMIT`. The sort-first shape is best when the two move together (a sequence id and its insert
+time), so the newest rows read first are the ones that pass the filter.
+
 The first column is also the sharding key. If it is HASH, it must be **high cardinality** and
 always present as an equality in the queries that use the index (a HASH column without an
-equality condition makes the index unusable for seeking). A HASH column like `tenant_id` with
-modest cardinality is fine; a boolean or status is not (see [low-cardinality.md](low-cardinality.md)).
+equality condition makes the index unusable for seeking). A boolean or status is never a good HASH
+lead (see [low-cardinality.md](low-cardinality.md)). For a column like `tenant_id`, decide from
+`pg_stats` (`n_distinct`):
+
+- **Many distinct values, no dominant one**: HASH spreads them well.
+- **Few values (tens) or one dominant tenant**: lead with it as a range column (`tenant_id ASC`).
+  A HASH key puts each value on one hash position, so a big tenant can never spread out; a range
+  index splits on the full key, inside one tenant, as it grows. It starts on one tablet: pre-split
+  it if it will be large from day one.
+- **No statistics**: follow how the schema's existing indexes lead with that column. A schema whose
+  secondary indexes are all `(tenant_id ASC, ...)` is telling you the convention.
+
+Never range-lead with a column that increases on insert (see [hotspots.md](hotspots.md)).
+
+Among several equality columns, put the ones existing indexes already lead with first, then the
+selective ones, and low-cardinality codes (`flag`, `status`, `active`, `*_type`) last. Equality
+columns can be in any order for the query itself, so keeping one order across similar indexes lets
+one index serve several queries. When the new index's equality columns include every key column
+of an existing index, put those first in the existing order: the new index then covers the old
+one, which can be dropped.
 
 ```sql
 -- ❌ Low-cardinality first → poor distribution
@@ -83,9 +107,32 @@ Use `INCLUDE` for columns that are:
 - Frequently in SELECT but not in WHERE/ORDER BY
 - Not useful as sharding/clustering keys themselves
 
+**Primary key columns count too.** A YSQL secondary index entry does hold the row's primary key,
+but only encoded (`ybctid`), and the query can't read the value back from it. A query that selects
+or sorts on a PK column needs that column in `INCLUDE` (or in the key) for an Index Only Scan:
+
+```sql
+-- SELECT session_log_id FROM log WHERE tenant_id = $1 AND agent_id = $2   (PK: (tenant_id, session_log_id))
+CREATE INDEX idx_log_tenant_agent ON log (tenant_id ASC, agent_id ASC) INCLUDE (session_log_id);
+```
+
+Don't INCLUDE wide columns (`json`, `jsonb`, `bytea`, large text): they are copied into every index
+entry. An `UPDATE` or `DELETE` reads the row anyway, so INCLUDE only helps `SELECT`.
+
 ---
 
 ## Redundant Indexes
+
+**Not redundant, but a double write: a range twin of a HASH primary key.** With
+`PRIMARY KEY ((tenant_id, id) HASH)` plus `INDEX (tenant_id ASC, id ASC)`, the index has the same
+columns but serves more (lookups by `tenant_id` alone, ranges and sorts on `id`), and every row is
+written twice. Keep one copy: if every query binds both columns, drop the index; otherwise reshape the primary
+key (a table rewrite) and drop the index. Choose the leading column the usual way: few tenants or
+one dominant tenant → `(tenant_id ASC, id ASC)`; many tenants → `(tenant_id HASH, id ASC)`, which
+still serves `tenant_id`-only lookups and ranges on `id`. Check that the new key doesn't leave
+another index redundant, or uncovered if it was only redundant because of the dropped one. If `id`
+comes from a sequence, each tenant's inserts go to the end of its range; the index already has that
+tail, so the reshape doesn't add one.
 
 Redundant indexes waste storage and add write overhead (every INSERT/UPDATE writes every index,
 often on another tablet) for zero read benefit. In YugabyteDB the prefix test must respect
