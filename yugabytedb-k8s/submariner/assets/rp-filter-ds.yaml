@@ -1,0 +1,41 @@
+# Sets loose reverse-path filtering (rp_filter=2) on every node, and keeps it set.
+#
+# Pods on non-gateway nodes reach the other cluster over vx-submariner, but replies come back from
+# the gateway on the node's main interface. The kernel uses the stricter of net.ipv4.conf.all and
+# the interface value, and Submariner only loosens vx-submariner and the CNI interface, so with
+# all=1 the replies are dropped. Apply before `subctl join`; it re-applies after node restarts and
+# runs on new nodes. On real clusters, prefer setting this in the node OS (/etc/sysctl.d).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rp-filter-loose
+  namespace: kube-system
+  labels: { app: rp-filter-loose }
+spec:
+  selector:
+    matchLabels: { app: rp-filter-loose }
+  template:
+    metadata:
+      labels: { app: rp-filter-loose }
+    spec:
+      hostNetwork: true                       # sysctls below then apply to the node's network namespace
+      tolerations: [{ operator: Exists }]     # every node, including control planes
+      priorityClassName: system-node-critical
+      containers:
+        - name: sysctl
+          image: busybox:1.36
+          securityContext: { privileged: true }
+          command: ["sh", "-c"]
+          args:
+            - |
+              # all + default (new interfaces) + every existing interface, then re-check every minute
+              # in case something resets it.
+              while true; do
+                for f in /proc/sys/net/ipv4/conf/*/rp_filter; do
+                  [ "$(cat "$f")" = 1 ] && echo 2 > "$f" && echo "set $f=2"
+                done
+                sleep 60
+              done
+          resources:
+            requests: { cpu: 1m, memory: 8Mi }
+            limits: { memory: 16Mi }

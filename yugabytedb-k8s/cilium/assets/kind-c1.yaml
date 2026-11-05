@@ -1,0 +1,8 @@
+# Source ("prod") cluster. Pod and service CIDRs must not overlap with kind-c2.yaml.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: c1
+networking:
+  disableDefaultCNI: true          # Cilium is the CNI
+  podSubnet: "10.10.0.0/16"        # must equal Cilium ipam.operator.clusterPoolIPv4PodCIDRList
+  serviceSubnet: "172.20.0.0/16"

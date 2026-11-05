@@ -36,6 +36,40 @@ Calculate optimal YugabyteDB cluster sizing from workload inputs, producing a co
 
 ---
 
+### [`yugabytedb-k8s-cilium`](yugabytedb-k8s/cilium/)
+
+Set up a Cilium Cluster Mesh with Multi-Cluster Services (MCS-API) between two Kubernetes clusters, deploy an independent YugabyteDB universe in each, and connect them with xCluster replication.
+
+**Covers:** kind clusters with non-overlapping CIDRs, `cilium install` with `clustermesh.mcsapi`, Cluster Mesh enable/connect, yugabyte Helm values for MCS (`createServiceExports`, `kubernetesClusterId`, clusterset `masterAddresses`, `totalMasters`), cross-cluster DNS checks, and `yb-admin` xCluster setup.
+
+**Triggers on:** *"Cilium Cluster Mesh with YugabyteDB"*, *"xCluster across Kubernetes clusters"*, *"YugabyteDB on kind with two clusters"*, `svc.clusterset.local` master addresses.
+
+**Sample prompts:**
+- *"Set up two kind clusters with Cilium Cluster Mesh and deploy YugabyteDB in each so I can test xCluster replication."*
+- *"Review my kind, Cilium and YugabyteDB Helm values for cross-cluster xCluster."*
+- *"`setup_xcluster_replication` times out even though the cluster mesh shows as connected."*
+
+More prompts are in the skill's [README](yugabytedb-k8s/cilium/README.md).
+
+---
+
+### [`yugabytedb-k8s-submariner`](yugabytedb-k8s/submariner/)
+
+Connect two Kubernetes clusters with Submariner, deploy an independent YugabyteDB universe in each, and connect them with xCluster replication.
+
+**Covers:** kind clusters with non-overlapping CIDRs, `subctl deploy-broker` / `join` (cluster ID, cable driver, NAT-T, gateway labelling), Lighthouse `clusterset.local` discovery, yugabyte Helm values for MCS (`createServiceExports`, `kubernetesClusterId`, clusterset `masterAddresses`, `totalMasters`), Globalnet for overlapping CIDRs, cross-cluster DNS checks, and `yb-admin` xCluster setup.
+
+**Triggers on:** *"Submariner with YugabyteDB"*, *"xCluster across Kubernetes clusters with Submariner"*, *"subctl join for YugabyteDB"*, Lighthouse `svc.clusterset.local` master addresses.
+
+**Sample prompts:**
+- *"Set up two kind clusters connected with Submariner and deploy YugabyteDB in each so I can test xCluster replication."*
+- *"Review my subctl join commands and YugabyteDB Helm values for cross-cluster xCluster."*
+- *"`subctl show connections` stays at `connecting` between my kind clusters."*
+
+More prompts are in the skill's [README](yugabytedb-k8s/submariner/README.md).
+
+---
+
 ## Structure
 
 ```
@@ -46,8 +80,19 @@ agent-skills/
 ├── yugabytedb-schema-design/    # Schema design skill
 │   ├── SKILL.md
 │   └── references/              # Per-topic reference guides
-└── yugabytedb-sizing/           # Cluster sizing skill
-    ├── SKILL.md
-    └── scripts/
-        └── sizing_calc.py       # Python sizing calculator
+├── yugabytedb-sizing/           # Cluster sizing skill
+│   ├── SKILL.md
+│   └── scripts/
+│       └── sizing_calc.py       # Python sizing calculator
+└── yugabytedb-k8s/
+    ├── cilium/                  # Cilium Cluster Mesh + xCluster skill
+    │   ├── SKILL.md
+    │   ├── assets/              # kind configs + Helm values
+    │   ├── scripts/             # mesh-up.sh, check-mcs-dns.sh
+    │   └── references/          # Troubleshooting guide
+    └── submariner/              # Submariner + xCluster skill
+        ├── SKILL.md
+        ├── assets/              # kind configs + Helm values
+        ├── scripts/             # submariner-up.sh, check-mcs-dns.sh
+        └── references/          # Troubleshooting guide
 ```

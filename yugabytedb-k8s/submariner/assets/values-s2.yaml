@@ -1,0 +1,33 @@
+# Target universe for xCluster, installed into kind-s2.
+# Each Kubernetes cluster runs an independent universe; Submariner Lighthouse exposes its pods to the other cluster.
+isMultiAz: true                 # makes the chart honour masterAddresses + replicas.totalMasters
+oldNamingStyle: true            # pods are yb-master-N / yb-tserver-N
+
+replicas:
+  master: 1
+  tserver: 1
+  totalMasters: 1               # sets --replication_factor; MUST equal the masters listed below
+
+multicluster:
+  createServiceExports: true    # creates ServiceExport for yb-masters / yb-tservers
+  kubernetesClusterId: "s2"     # MUST equal subctl join --clusterid
+  mcsApiVersion: "multicluster.x-k8s.io/v1alpha1"
+
+# One entry per master. Use the clusterset name: it is the broadcast address the chart gives
+# each master, and the address the other universe uses to reach it.
+# ${NAMESPACE} is literal here; envsubst expands it inside the pod.
+masterAddresses: "yb-master-0.s2.yb-masters.${NAMESPACE}.svc.clusterset.local:7100"
+
+enableLoadBalancer: false       # no LoadBalancer services on kind
+
+# Laptop-sized. Remove for real clusters.
+resource:
+  master:
+    requests: { cpu: "0.5", memory: 1Gi }
+    limits:   { cpu: "1",   memory: 1Gi }
+  tserver:
+    requests: { cpu: "0.5", memory: 2Gi }
+    limits:   { cpu: "2",   memory: 2Gi }
+storage:
+  master:  { count: 1, size: 5Gi }
+  tserver: { count: 1, size: 5Gi }

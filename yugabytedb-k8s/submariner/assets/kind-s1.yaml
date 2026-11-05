@@ -1,0 +1,11 @@
+# Source ("prod") cluster. Pod and service CIDRs must not overlap with kind-s2.yaml, with the
+# docker "kind" network the nodes sit on (usually 172.18.0.0/16), or with the cilium skill's clusters.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: s1
+networking:
+  podSubnet: "10.30.0.0/16"        # pass as subctl join --clustercidr
+  serviceSubnet: "10.130.0.0/16"   # pass as subctl join --servicecidr
+nodes:
+  - role: control-plane
+  - role: worker                   # labelled submariner.io/gateway=true

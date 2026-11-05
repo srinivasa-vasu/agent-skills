@@ -1,0 +1,10 @@
+# Target ("dev"/DR) cluster. Pod and service CIDRs must not overlap with kind-s1.yaml.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: s2
+networking:
+  podSubnet: "10.40.0.0/16"
+  serviceSubnet: "10.140.0.0/16"
+nodes:
+  - role: control-plane
+  - role: worker

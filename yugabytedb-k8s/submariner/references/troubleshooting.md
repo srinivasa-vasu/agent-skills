@@ -1,0 +1,27 @@
+# Troubleshooting
+
+Start with `subctl show all --context <ctx>` and `subctl diagnose all --context <ctx>` on both
+clusters. `subctl diagnose firewall inter-cluster --context kind-s1 --remotecontext kind-s2`
+checks the tunnel ports.
+
+| Symptom | Likely cause | Check / fix |
+|---|---|---|
+| kind: `subctl join` fails with `x509: certificate is not trusted` or `connect: no route to host` against `https://127.0.0.1:<port>` | Host-run subctl: broker URL is the host-mapped API port, unreachable from the other cluster's pods; macOS also blocks the host binary | Run subctl from `quay.io/submariner/subctl:<ver>` on the `kind` docker network with `kind get kubeconfig --internal` (what `scripts/submariner-up.sh` does), and redeploy the broker |
+| `subctl show connections`: "No gateways detected" / "No connections found" right after join | Gateway pods still pulling images, or no node labelled | Wait for `kubectl -n submariner-operator get pods` to be Ready; `kubectl get nodes -L submariner.io/gateway` |
+| `subctl join` prompts for a gateway node / hangs in CI | No node labelled `submariner.io/gateway=true` | Label a worker first, pass `--label-gateway=false` |
+| `subctl show connections` stays `connecting` / `error` | Tunnel ports blocked, wrong NAT-T setting, or IPsec unavailable on the host kernel | Real clusters: open UDP 4500/4490 between gateways, keep `--natt` on behind NAT. kind: `--natt=false`; if libreswan still fails, rejoin with `--cable-driver vxlan`. `kubectl -n submariner-operator logs ds/submariner-gateway` |
+| Tunnel connected but cross-cluster pods unreachable | Overlapping pod/service CIDRs, wrong `--clustercidr`/`--servicecidr`, or CIDRs overlapping the node network | `subctl show networks --context <ctx>`; fix CIDRs or redeploy with Globalnet |
+| Only pods on the gateway node can reach the other cluster; `subctl verify` specs where the "pod is not on a gateway" time out; route agent logs `Failed to successfully ping the remote endpoint` | Strict `net.ipv4.conf.all.rp_filter=1` on the nodes drops replies that come back from the gateway on `eth0` instead of `vx-submariner`, or UDP 4800 blocked between nodes | `docker exec <node> sysctl net.ipv4.conf.all.rp_filter` (kind) → `kubectl apply -f assets/rp-filter-ds.yaml`, or set `rp_filter=2` in the node OS; else `subctl diagnose firewall intra-cluster --context <ctx>` |
+| Calico cluster: traffic SNATed or dropped | Calico IPPools for the remote CIDRs missing (`natOutgoing: false`, `disabled: true`), or Calico not in VXLAN mode | Submariner creates the pools only if the Calico API server is installed; otherwise create them by hand |
+| `subctl diagnose kube-proxy-mode` fails | kube-proxy in IPVS mode | Submariner only supports iptables mode |
+| `*.svc.clusterset.local` NXDOMAIN | Lighthouse not deployed (`--components` without service-discovery) or CoreDNS forward missing | `kubectl -n kube-system get cm coredns -o yaml` should forward `clusterset.local` to `submariner-lighthouse-coredns`; `kubectl -n submariner-operator get pods` |
+| No ServiceImport in the namespace | Chart not creating ServiceExport, export not valid, or namespace differs between clusters | `kubectl get serviceexports -n <ns> -o yaml` → conditions `Valid`, `Ready` (and no `Conflict`); same namespace both sides |
+| Service name resolves, per-pod name (`yb-master-0.s1.yb-masters…`) does not | `kubernetesClusterId` ≠ `--clusterid`, or the service isn't headless | `kubectl get endpointslices -n <ns> -l multicluster.kubernetes.io/source-cluster` |
+| yb-master stays not ready, logs `Unable to find self in master addresses` / election never completes | `masterAddresses` not using the broadcast (clusterset) names, lists masters that don't exist, or Lighthouse < 0.16 doesn't publish not-ready pods so the master can't resolve itself | Make `masterAddresses` match the chart's broadcast address and real master count; upgrade Submariner |
+| Universe up but tables under-replicated / `Not enough live tablet servers` | `replicas.totalMasters` left at 3 with 1 master/1 tserver → RF 3 | Set `totalMasters` = master count; reinstall after deleting PVCs |
+| Master still uses old addresses after `helm upgrade` | Raft config persisted on PVC | Delete PVCs / namespace and reinstall (demo), or `yb-admin change_master_config` (real) |
+| `setup_xcluster_replication` / `setup_universe_replication` times out | Target can't reach **source tservers** (not just masters) | `scripts/check-mcs-dns.sh` from kind-s2; source tserver broadcast must be the clusterset name |
+| Replication works, then stalls after a gateway node restarts | Single gateway node per cluster is a single point of failure | Label two nodes as gateways (active/passive) on real clusters |
+| Automatic-DDL mode: setup succeeds, first `CREATE TABLE` never appears on the target, `get_xcluster_safe_time` lag keeps growing, target master logs `AddTableToXClusterTargetTask … Waiting for xCluster safe time`, other groups stall too | Target database created by hand instead of restored from a source backup (OIDs don't match). Not a network problem | `src drop_xcluster_replication <group> $TGT`; redo with a backup/restore, or use semi-automatic mode |
+| `get_replication_status` shows errors after setup | Schema mismatch (semi-automatic mode) or data present without bootstrap | Compare schemas; rerun `is_xcluster_bootstrap_required` |
+| Pods `Pending` | Default chart resources (2 CPU / 4 GiB per tserver) too large for kind | Use the reduced `resource:` block in `assets/values-*.yaml` |
