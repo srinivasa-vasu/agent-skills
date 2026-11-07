@@ -45,6 +45,7 @@ NULL_HEAVY = 0.30           # null_frac at or above this
 LARGE_TABLE = 1_000_000     # reltuples considered large
 PRESPLIT_ROWS = 100_000     # range index on one tablet above this many rows -> pre-split
 SCAN_RATIO = 50             # docdb_rows_scanned / rows returned
+SCAN_PER_CALL = 100         # and at least this many DocDB rows scanned per call
 SLOW_MEAN_MS = 20           # statement mean time worth an index review
 HEAVY_SHARE = 0.05          # statement's share of all statement time worth an index review
 SMALL_TABLE = 1_000         # known row count below this: a full scan is cheap
@@ -504,10 +505,16 @@ class Findings:
             "rule": rule, "severity": severity, "evidence": evidence, "confidence": confidence,
             "object": obj, "title": title, "detail": detail, "recommendation": recommendation,
             "reference": reference, "actions": actions or [], "needs_confirmation": confirm or [],
-            "data": data or {},
+            "data": dict(data or {}),
             # set by the reviewer, then re-render: proposed | accepted | rejected
             "status": "proposed", "review_note": "",
         })
+
+        d = self.items[-1]["data"]
+        if "queryids" not in d:
+            refs = [r for k in ("statements", "range_statements") for r in d.get(k) or [] if isinstance(r, dict)]
+            if refs:
+                d["queryids"] = [r["queryid"] for r in refs]
 
     def sorted(self):
         out = sorted(self.items, key=lambda f: (SEV_ORDER[f["severity"]],
@@ -569,10 +576,11 @@ def recreate_sql(i):
     return re.sub(r" ON ONLY ", " ON ", sql, count=1) + ";"
 
 
-def index_tail(i):
+def index_tail(i, split=""):
+    """INCLUDE, SPLIT AT and WHERE clauses of a rebuilt index, in the order YSQL requires."""
     inc = f" INCLUDE ({', '.join(c['expr'] for c in i['include'])})" if i["include"] else ""
     pred = f" WHERE {i['predicate']}" if i["predicate"] else ""
-    return inc + pred
+    return inc + split + pred
 
 
 def split_clause(values):
@@ -581,6 +589,65 @@ def split_clause(values):
 
 def bucket_split(n):
     return split_clause([str(b) for b in range(1, n)])
+
+
+def split_points(m, t, cols, desc=()):
+    """Pre-split points for a range key over columns `cols` -> (points or None, split column, prefix).
+    Leading columns that hold one value (by stats) form a fixed prefix, since splitting on them gives
+    nothing; the first column after them supplies the points from its known values (enum, boolean,
+    MCVs), at most one per node beyond the first, chosen so the slices hold about equal shares of
+    the rows. Points are composite when there is a prefix: ((1, 'a'), (1, 'b')), and follow the
+    column's order (descending for a DESC column)."""
+    prefix = []
+    for c in cols:
+        col = t["cols_by_name"].get(c)
+        if col is None:
+            return None, None, prefix
+        s = m.colstat(t, c) or {}
+        mcv = parse_pg_array(s["most_common_vals"]) if s.get("most_common_vals") else None
+        nd, src = m.distinct(t, {"attnum": col["attnum"]})
+        if src == "stats" and nd is not None and nd <= 1 and mcv and len(mcv) == 1:
+            prefix.append((c, mcv[0]))
+            continue
+        vals = m.split_values(t, {"attnum": col["attnum"]})
+        if not vals:
+            return None, c, prefix
+        n = m.buckets
+        if len(vals) > n - 1:
+            freqs = parse_pg_array(s.get("most_common_freqs") or "") or []
+            share = {str(v): float(f) for v, f in zip(mcv or [], freqs)}
+            tot = sum(share.values()) or 1
+            picked = []
+            if any(str(v) in share for v in vals):
+                # a point starts a new slice once the rows before it reach the next 1/n
+                acc = (tot - sum(share.get(str(v), 0) for v in vals)) / tot    # values below the first point
+                for v in vals:
+                    if acc >= (len(picked) + 1) / n and len(picked) < n - 1:
+                        picked.append(v)
+                    acc += share.get(str(v), 0) / tot
+            # no frequencies (enum labels): evenly spaced values
+            vals = picked or [vals[round(k * len(vals) / n)] for k in range(1, n)]
+        if c in desc:
+            vals = vals[::-1]
+        return [", ".join([ql(v) for _, v in prefix] + [ql(v)]) for v in vals], c, prefix
+    return None, None, prefix
+
+
+def split_query(m, t, col, prefix, desc=False, pred=None):
+    """SQL that computes split points for `col` from the data: the boundary of each of N equal
+    slices (N = buckets, one tablet per node), all but the last, in the column's index order.
+    pred: a partial index's predicate, so only the rows it holds count."""
+    n = m.buckets
+    where = " AND ".join([f"{qi(c)} = {ql(v)}" for c, v in prefix] + ([f"({pred})"] if pred else []))
+    agg, order = ("min", " DESC") if desc else ("max", "")
+    return (f"SELECT {agg}({qi(col)}) AS split_at FROM (SELECT {qi(col)}, ntile({n}) OVER (ORDER BY {qi(col)}{order}) AS b "
+            f"FROM {tname(t)}{' WHERE ' + where if where else ''}) s GROUP BY b ORDER BY b LIMIT {n - 1};")
+
+
+def split_template(m, prefix):
+    """SPLIT AT VALUES with placeholders for the points split_query returns."""
+    pre = "".join(f"{ql(v)}, " for _, v in prefix)
+    return split_clause([f"{pre}<split_at {k}>" for k in range(1, m.buckets)])
 
 
 def index_keys_sql(i):
@@ -614,7 +681,7 @@ def replace_index(i, keys, split="", note=None):
     (hints and monitoring keep working)."""
     t = i["table"]
     tmp = (i["name"][:59] + "_new")
-    create = f"CREATE INDEX IF NOT EXISTS {qi(tmp)} ON {tname(t)} ({keys}){index_tail(i)}{split};"
+    create = f"CREATE INDEX IF NOT EXISTS {qi(tmp)} ON {tname(t)} ({keys}){index_tail(i, split)};"
     swap = swap_sql(i, tmp)
     return [act("create", create, "create", target=f"{t['schema']}.{tmp}", replaces=i["fq"],
                 rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(tmp)};", note=note),
@@ -1059,7 +1126,7 @@ def rule_hash_on_range_type(m, F):
                            pk_reshape(t, i, k)]
             elif i["is_unique"]:
                 actions = [manual(f"CREATE UNIQUE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
-                                  f"({keys}){index_tail(i)}{split};",
+                                  f"({keys}){index_tail(i, split)};",
                                   note="unique index: verify the new key enforces the same rule, then swap")]
             else:
                 actions = replace_index(i, keys, split)
@@ -1311,7 +1378,7 @@ def rule_monotonic_range(m, F):
                                note="HASH the PK; range scans / ORDER BY on the key lose their index order")]
         elif i["is_unique"]:
             actions = [manual(f"CREATE UNIQUE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
-                              f"({bucket_keys(m, i, k0)}){index_tail(i)}{bucket_split(m.buckets)};",
+                              f"({bucket_keys(m, i, k0)}){index_tail(i, bucket_split(m.buckets))};",
                               note="unique index: verify, then swap it in by hand")]
         else:
             actions = replace_index(i, bucket_keys(m, i, k0), bucket_split(m.buckets),
@@ -1332,6 +1399,9 @@ def rule_lowcard_hash(m, F):
         t = i["table"]
         if i["predicate"] and _fixed_by_predicate(i["predicate"], i["keys"][0]["expr"]):
             continue                                   # reported by partial-keyed-on-predicate
+        # a HASH key that is the whole key of a unique index (or the PK) has one hash value per row
+        if (i["is_unique"] or i["is_pk"]) and i["hash_count"] == len(i["keys"]):
+            continue
         est, srcs = 1.0, set()
         for k in i["keys"][:i["hash_count"]]:
             nd, src = m.distinct(t, k)
@@ -1365,11 +1435,8 @@ def rule_lowcard_hash(m, F):
         if est is None or est > LOWCARD_MAX:
             continue
         rows = m.rows(t)
-        # a HASH key that is the whole key of a unique index (or the PK) has one hash value per row,
-        # and a key with about as many values as rows is unique in practice: few values then only
+        # a key with about as many values as rows is unique in practice: few values then only
         # means a small table, not skew
-        if (i["is_unique"] or i["is_pk"]) and i["hash_count"] == len(i["keys"]):
-            continue
         if rows is not None and (min(est, rows) >= UNIQUE_RATIO * rows or rows < SMALL_TABLE):
             continue
         ev = "stats" if "stats" in srcs else "schema"
@@ -1589,22 +1656,50 @@ def rule_presplit(m, F):
         if not rows or rows < PRESPLIT_ROWS:
             continue
         sev = "medium" if rows >= LARGE_TABLE else "low"
-        vals = m.split_values(t, i["keys"][0])
-        hint = (f" Known values allow SPLIT AT VALUES ({', '.join('(' + ql(v) + ')' for v in vals)})."
-                if vals else "")
-        actions = [manual(f"-- yb-admin -master_addresses <masters> list_tablets ysql.{m.meta.get('database')} "
-                          f"{i['name'] if not i['is_pk'] else t['name']}   # confirm the tablet count first")]
-        if vals and not i["is_pk"] and not i["is_unique"]:
-            actions.append(manual(replace_index(i, ", ".join(key_sql(c) for c in i["keys"]),
-                                                split_clause([ql(v) for v in vals]))[0]["sql"],
-                                  note="rebuild pre-split, then swap it in"))
+        # split points are positional: stop at the first expression key (e.g. a bucket)
+        cols = []
+        for c in i["keys"]:
+            if not c["attnum"]:
+                break
+            cols.append(c["expr"])
+        desc = {c["expr"] for c in i["keys"] if c["opt"] == "DESC"}
+        points, scol, prefix = split_points(m, t, cols, desc)
+        fixed = (f" {', '.join(f'{c} holds one value ({v})' for c, v in prefix)}, so the split points fall "
+                 f"inside it, on {scol}." if prefix and scol else "")
+        if scol and m.monotonic(t, {"attnum": t["cols_by_name"][scol]["attnum"]})[0]:
+            fixed += (f" {scol} grows with inserts: splitting spreads the existing rows and their reads, but new "
+                      "rows still all land on the newest tablet (see range-hot-tails for the write side).")
+        name = i["name"] if not i["is_pk"] else t["name"]
+        rebuild = not i["is_pk"] and not i["is_unique"]
+        keys = ", ".join(key_sql(c) for c in i["keys"])
+        actions = []
+        if points:
+            if rebuild:
+                actions.append(manual(replace_index(i, keys, split_clause(points))[0]["sql"],
+                                      note="rebuild pre-split on the known values, then swap it in"))
+        elif scol:
+            actions.append(manual(split_query(m, t, scol, prefix, scol in desc, i["predicate"]),
+                                  note=f"compute {m.buckets - 1} split points on {scol} (reads the whole "
+                                       "table: run it off-peak)"))
+            if rebuild:
+                actions.append(manual(replace_index(i, keys, split_template(m, prefix))[0]["sql"],
+                                      note="rebuild with the points from the query above, then swap it in"))
+        split_live = "split the live tablet with `yb-admin split_tablet <tablet_id>`"
+        if rebuild and (points or scol):
+            how = f"rebuild it pre-split (below) and swap it in, or {split_live}"
+        elif rebuild:
+            how = f"{split_live} (no split points can be derived for its leading key)"
+        else:
+            how = f"{split_live} (rebuilding a primary key or unique index means a table rewrite)"
         F.add("range-single-tablet", sev, "stats", i["fq"], "Range-sharded relation on a single tablet",
               f"{i['name']} on {t['fq']} ({int(rows):,} rows) is range-sharded and has 1 tablet: all reads and "
-              f"writes go to one tablet leader until auto-splitting catches up.",
-              "Pre-split new range indexes/tables with SPLIT AT VALUES; for existing ones, confirm auto-splitting "
-              "is enabled and the tablet count in yb-admin (num_tablets can be stale)." + hint,
+              "writes go to one tablet leader until auto-splitting catches up, and a small index can stay below "
+              f"the split size threshold for a long time.{fixed}",
+              f"Confirm the tablet count first (the catalog value can be stale). If it is still 1, {how}. Create "
+              "new range indexes on large tables with SPLIT AT VALUES.",
               REF["lowcard"] + "#why-range-sharding-works-here-the-hidden-pk-suffix", actions=actions,
-              confirm=["Current tablet count (yb-admin list_tablets) — the catalog value may be stale."])
+              confirm=[f"Current tablet count: yb-admin -master_addresses <masters> list_tablets "
+                       f"ysql.{m.meta.get('database')} {name}"])
 
 
 def _fixed_by_predicate(pred, col):
@@ -1814,21 +1909,130 @@ def rule_unused(m, F):
               data={"indexes": [i["definition"] for i in idx]})
 
 
+AGG_RE = re.compile(r"\b(?:count|sum|avg|min|max)\s*\(|\bgroup\s+by\b|\bdistinct\b", re.I)
+# conditions the statement parser does not map to index columns: applied after the index read
+RESIDUAL_RE = [(re.compile(r"\bnot\s+in\s*\(|!=|<>", re.I), "NOT IN / != (an exclusion can't seek: list the wanted "
+                                                            "values with IN (...) or index a partial on the excluded ones)"),
+               (re.compile(r"->>?|#>>?", re.I), "a JSON field (promote it to a column, or index the expression "
+                                                "when the key is a constant)"),
+               (re.compile(r"\bor\b", re.I), "OR (split into UNION ALL branches that each use an index)"),
+               (re.compile(r"\b(?:i?like)\b", re.I), "LIKE (only a constant prefix with text_pattern_ops can seek)")]
+
+
+def scan_diagnosis(m, s):
+    """Why a scan-heavy statement reads many rows when no statement finding covers it ->
+    (all tables small, text). Per table: small-table scan, or the best index and what it leaves to
+    filtering (wrapped columns, exclusions, JSON, OR), and aggregates (few rows back by design)."""
+    q = s["query"]
+    per_call = s["docdb_rows_scanned"] / max(s["calls"], 1)
+    parts, small_all = [], True
+    for t, a in statement_access(m, s):
+        rows = m.rows(t)
+        small = rows is not None and rows < SMALL_TABLE
+        small_all &= small
+        usable = [i for i in t["indexes"] if i["am"] == "lsm" and i["is_valid"] and not i["is_partition"]
+                  and _pred_cols(t, i) <= set(a["eq"]) | set(a["range"])]
+        best, served = None, []
+        for i in usable:
+            out, rcol, _ = index_reach(t, i, a)
+            cols = out + ([rcol] if rcol else [])
+            if len(cols) > len(served):
+                best, served = i, cols
+        unserved = [c for c in list(a["eq"]) + list(a["range"]) if c not in served]
+        if small:
+            parts.append(f"{t['fq']} has ~{rows:,.0f} rows, so each call reads most of the table (~{per_call:,.0f} "
+                         "rows). That is cheap per call; the total comes from the call count."
+                         + (f" An index on ({', '.join(served + unserved)}) would make it a direct lookup: worth it "
+                            "only if this latency matters." if unserved else ""))
+            continue
+        if best:
+            txt = f"On {t['fq']}, {best['name']} serves {', '.join(served)}"
+            if unserved:
+                txt += f"; {', '.join(unserved)} are filtered after the index read"
+            if unserved:
+                txt += (f" (an index on ({', '.join(served + unserved)}) would read only the matching rows; "
+                        "check that the extra columns narrow it enough to pay for the extra write)")
+        else:
+            txt = f"On {t['fq']}, no index serves these conditions"
+        # an IN list ahead of the sort column: each IN value is in order, but the rows of all values
+        # are read and sorted before LIMIT applies
+        ins = [c for c in a["in"] if c in served]
+        if a["limit"] and a["order"] and ins and a["order"][0] not in a["eq"]:
+            txt += (f". The IN lists on {', '.join(ins)} come before the ORDER BY column {a['order'][0]}: every "
+                    "matching row is read and sorted before LIMIT applies. Paginate by key (`AND "
+                    f"{a['order'][0]} > $last`), shorten the IN lists, or run one query per IN value and merge")
+        # a JSON field (col->>'k') is listed under JSON below, not as a cast
+        residual = [w for w in a["wrapped"] if not re.search(r'\b%s"?\s*(?:->|#>)' % re.escape(w), q)]
+        why = [f"`{', '.join(residual)}` is cast or wrapped in a function (compare the bare column instead, "
+               "e.g. `col < $1::date + 1` for `col::date <= $1`)"] if residual else []
+        where = re.split(r"\bwhere\b", q, maxsplit=1, flags=re.I)
+        why += [label for rx, label in RESIDUAL_RE if len(where) > 1 and rx.search(where[1])]
+        if why:
+            txt += ". Rows that match are then filtered by " + "; ".join(why)
+        parts.append(txt + ".")
+    if AGG_RE.search(q):
+        parts.append("It aggregates (COUNT / GROUP BY / DISTINCT), so it returns few rows by design: the cost is "
+                     f"the ~{per_call:,.0f} matching rows each call reads. An Index Only Scan (every referenced "
+                     "column in the index) or a maintained counter cuts it.")
+    if not small_all:
+        parts.append("If an index above was created during the statement window, the counters still include "
+                     "scans from before it: reset pg_stat_statements and re-collect to confirm.")
+    return small_all, " ".join(parts)
+
+
 def rule_inefficient_statements(m, F):
+    """Statements that read far more DocDB rows than they return. Runs after the statement access
+    rules: a statement one of their findings covers links to it (resolved to finding ids by
+    resolve_links), otherwise scan_diagnosis says why it reads that much."""
+    covering = defaultdict(list)
+    for f in F.items:
+        for qid in f["data"].get("queryids", []):
+            covering[str(qid)].append(f)
+    total_ms = sum(x["total_time_ms"] for x in m.statements)
     for s in m.statements[:200]:
         scanned = s.get("docdb_rows_scanned")
         if scanned is None or s["calls"] < 10:
             continue
         ratio = scanned / max(s["rows"], 1)
-        if ratio < SCAN_RATIO or scanned < 10_000:
+        if ratio < SCAN_RATIO or scanned < 10_000 or scanned / s["calls"] < SCAN_PER_CALL:
             continue
-        F.add("scan-heavy-statement", "medium", "workload", f"queryid {s['queryid']}",
-              "Statement scans far more rows than it returns",
-              f"{s['calls']:,} calls, {s['total_time_ms']:,.0f} ms total; DocDB scanned {scanned:,} rows to return "
-              f"{s['rows']:,} ({ratio:,.0f}×).",
-              "Check for a missing index, a HASH column used for range/ORDER BY, or a filter that is not pushed "
-              "down. Get the plan with EXPLAIN (ANALYZE, DIST) on staging.",
-              REF["index"], confidence="medium", data={"statement": stmt_ref([s], 1)[0]})
+        mean = s["total_time_ms"] / max(s["calls"], 1)
+        detail = (f"{s['calls']:,} calls, {s['total_time_ms']:,.0f} ms total (mean {mean:,.1f} ms); DocDB scanned "
+                  f"{scanned:,} rows to return {s['rows']:,} ({ratio:,.0f}×), ~{scanned / s['calls']:,.0f} rows "
+                  "per call.")
+        links = [f for f in covering[str(s["queryid"])] if f["rule"] != "scan-heavy-statement"]
+        sev = "medium"
+        if links:
+            rec = "{links}. Then confirm with EXPLAIN (ANALYZE, DIST) and real parameters."
+        else:
+            small, why = scan_diagnosis(m, s)
+            detail += " " + why
+            sev = "low" if small else "medium"
+            rec = ("No index change is proposed: a full read of a small table is cheap per call. " if small else
+                   "No index is proposed: the detail names what the best index leaves to filtering and how to "
+                   "cut it (rewrite the condition, paginate by key, or extend the index). ") + \
+                  "Confirm where the rows are read with EXPLAIN (ANALYZE, DIST) and real parameters."
+        F.add("scan-heavy-statement", sev, "workload", f"queryid {s['queryid']}",
+              "Statement scans far more rows than it returns", detail, rec, REF["index"], confidence="medium",
+              data={"statements": [dict(stmt_ref([s], 1)[0], mean_ms=round(mean, 2),
+                                        share=round(s["total_time_ms"] / total_ms, 4) if total_ms else None)],
+                    "queryids": [s["queryid"]], "_links": links})
+
+
+def resolve_links(findings):
+    """Turn a scan-heavy finding's links to the statement findings that cover it into their ids."""
+    for f in findings:
+        links = f["data"].pop("_links", None)
+        if links:
+            fix = [x for x in links
+                   if any(re.match(r"\s*(CREATE|ALTER|DROP)\b", a["sql"], re.I) for a in x["actions"])]
+            see = [x for x in links if x not in fix]
+            ref = lambda xs: ", ".join(f"{x['id']} ({x['rule']})" for x in sorted(xs, key=lambda x: x["id"]))
+            txt = (f"The fix (index or key change) is proposed in {ref(fix)}" if fix else
+                   f"Covered by {ref(see)}, which explains the access path but proposes no change here")
+            if fix and see:
+                txt += f"; see also {ref(see)}"
+            f["recommendation"] = f["recommendation"].replace("{links}", txt)
 
 
 # ---- statement access rules
@@ -1973,6 +2177,21 @@ def new_index_name(t, cols):
     return base[:63]
 
 
+LOWCARD_SELECTIVE = 0.10    # low-cardinality filters still worth an index when one call reads at most this share
+
+
+def filter_share(m, t, cols):
+    """Share of the table one call reads when it binds `cols` by equality (1/distinct per column,
+    independent columns assumed) -> fraction or None without estimates."""
+    share = 1.0
+    for c in cols:
+        nd, _ = m.distinct(t, {"attnum": t["cols_by_name"][c]["attnum"]})
+        if not nd:
+            return None
+        share /= max(nd, 1)
+    return share
+
+
 INCLUDE_MAX = 4             # more non-key columns than this: no INCLUDE proposed
 WIDE_TYPES = {"json", "jsonb", "bytea", "xml", "tsvector"}   # never copied into an index via INCLUDE
 
@@ -1990,12 +2209,25 @@ def include_cols(t, accs, keycols):
     return need if 0 < len(need) <= INCLUDE_MAX else None
 
 
-def workload_index(t, name, keys, eq_cols):
+def workload_index(m, t, name, keys, cols, eq_cols):
     """A CREATE INDEX proposed from statement text: runnable in its own changes.sql phase.
-    eq_cols: key columns the statements bind by equality (their order in the key is free)."""
-    a = act("workload", f"CREATE INDEX IF NOT EXISTS {qi(name)} ON {tname(t)} ({', '.join(keys)});", "create",
-            target=f"{t['schema']}.{name}", rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(name)};",
-            note="derived from the statement text; confirm with EXPLAIN (ANALYZE, DIST)")
+    eq_cols: key columns the statements bind by equality (their order in the key is free). A
+    range-led index on a large table is pre-split when stats give the points; otherwise the note
+    carries the query that computes them (it would start on one tablet)."""
+    note, split = "derived from the statement text; confirm with EXPLAIN (ANALYZE, DIST)", ""
+    rows = m.rows(t)
+    colocated = (t.get("yb") or {}).get("is_colocated")
+    if "HASH" not in keys[0] and rows and rows >= PRESPLIT_ROWS and not colocated and t["relkind"] != "p":
+        desc = {k.rsplit(" ", 1)[0] for k in keys if k.endswith(" DESC")}
+        points, scol, prefix = split_points(m, t, cols, desc)
+        if points:
+            split = split_clause(points)
+        elif scol:
+            note += (f". {int(rows):,} rows: it starts on one tablet. To pre-split, get points with "
+                     f"{split_query(m, t, scol, prefix, scol in desc)} and append{split_template(m, prefix)}")
+    a = act("workload", f"CREATE INDEX IF NOT EXISTS {qi(name)} ON {tname(t)} ({', '.join(keys)}){split};",
+            "create", target=f"{t['schema']}.{name}", rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(name)};",
+            note=note)
     a["eq_cols"] = list(eq_cols)
     return a
 
@@ -2107,6 +2339,7 @@ def rule_statement_access(m, F):
         confirm = [f"Check the plan: EXPLAIN (ANALYZE, DIST) of queryid {s0['queryid']} with real parameters."]
         data = {"indexes": [i["definition"] for i in t["indexes"]],
                 "access": {k: list(a[k]) for k in ("eq", "range", "wrapped")},
+                "queryids": [x[0]["queryid"] for x in stmts],
                 "statements": [dict(r, mean_ms=round(r["total_time_ms"] / max(r["calls"], 1), 2),
                                     share=round(x[2], 4)) for r, x in zip(stmt_ref([x[0] for x in stmts]), stmts)]}
         wrapped = list(a["wrapped"])
@@ -2131,20 +2364,28 @@ def rule_statement_access(m, F):
                            f"leads with {cs[0]}, which the statements don't bind: if the application knows "
                            f"{cs[0]}, adding it to the WHERE clause uses that index without a new one.")
                 hint = f"First check whether the statements should also filter on {cs[0]} (see above). "
-            if eq and all(_lowcard_col(m, t, c) for c in eq) and not rng:
+            fshare = filter_share(m, t, eq) if eq else None
+            # low-cardinality filters on a large table still pay when each call reads a small share
+            selective = rows and rows >= PRESPLIT_ROWS and fshare is not None and fshare <= LOWCARD_SELECTIVE
+            if eq and all(_lowcard_col(m, t, c) for c in eq) and not rng and not selective:
                 rec = (f"The only filters ({', '.join(eq)}) look low-cardinality: an index on them alone puts all "
                        "rows in a few keys. If the value queried is rare, add a partial index "
-                       f"(WHERE {eq[0]} = <value>) keyed on a selective column; otherwise a scan of a small table "
-                       "is fine, and caching the result in the application is cheaper.")
+                       f"(WHERE {eq[0]} = <value>) keyed on a selective column; otherwise "
+                       + ("a scan of a small table is fine" if rows is not None and rows < SMALL_TABLE else
+                          "each call reads a large share of the table anyway")
+                       + ", and caching the result in the application is cheaper.")
             elif eq or rng:
                 keys, cols = proposed_keys(m, t, eq, rng, desc=a["desc"], inlist=a["in"])
                 new = new_index_name(t, cols)
                 rec = (f"{hint}Add an index that leads with the equality columns ({', '.join(keys)}); low-cardinality "
                        "columns go after the selective ones.")
+                if selective and all(_lowcard_col(m, t, c) for c in eq):
+                    rec += (f" The filters are low-cardinality, but on {rows:,.0f} rows each call reads about "
+                            f"{fshare:.1%} of the table through the index instead of all of it.")
                 mono, _ = m.monotonic(t, {"attnum": t["cols_by_name"][rng[0]]["attnum"]}) if rng and not eq else (None, None)
                 if mono:
                     rec += f" {rng[0]} increases on insert ({mono}): a range index leading with it is a write hot spot; see the bucketed pattern."
-                actions = [workload_index(t, new, keys, [c for c in cols if c in a["eq"]])]
+                actions = [workload_index(m, t, new, keys, cols, [c for c in cols if c in a["eq"]])]
             else:
                 rec = "Rewrite the filter on the bare column, or create an expression index."
             title = "Statements filter on columns no index leads with"
@@ -2163,7 +2404,7 @@ def rule_statement_access(m, F):
                    f"of ({proposed_keys(m, t, [], [], lead=tuple(bound))[0][0]}, "
                    f"{', '.join(c + ' ASC' for c in missing)}) serves both, but "
                    "changing the primary key rewrites the table.")
-            actions = [workload_index(t, new, keys, [c for c in cols if c in a["eq"]])]
+            actions = [workload_index(m, t, new, keys, cols, [c for c in cols if c in a["eq"]])]
             title = "Statements bind only part of a HASH key"
             if g["elsewhere"]:
                 el = sorted(g["elsewhere"])
@@ -2183,7 +2424,7 @@ def rule_statement_access(m, F):
             new = new_index_name(t, cols)
             rec = (f"Add an index with {c} as a range column after the equality columns ({', '.join(keys)}), "
                    f"or change {c} to ASC/DESC in {i['name']} if no query needs it as an exact-match hash.")
-            actions = [workload_index(t, new, keys, [c for c in cols if c in a["eq"]])]
+            actions = [workload_index(m, t, new, keys, cols, [c for c in cols if c in a["eq"]])]
             title = "Range filter or sort on a HASH column"
         else:
             i, reached, unbound = g["index"], g["reached"], g["unbound"]
@@ -2195,17 +2436,22 @@ def rule_statement_access(m, F):
             new = new_index_name(t, cols)
             rec = (f"Extend the key with the selective unbound columns ({', '.join(keys)}), as a new index or by "
                    f"replacing {i['name']} if nothing else depends on its current order.")
-            actions = [workload_index(t, new, keys, [c for c in cols if c in a["eq"]])]
+            actions = [workload_index(m, t, new, keys, cols, [c for c in cols if c in a["eq"]])]
             title = "Index serves only part of the statement's filter"
         if actions and cols and keys and not keys[0].startswith("("):
             opt, why = lead_opt(m, t, cols[0])
             if why and keys[0].endswith(" " + opt):
                 rec += f" {cols[0]} leads {'HASH' if opt == 'HASH' else 'as a range column (ASC)'}: {why}."
                 if opt == "ASC":
-                    rec += " A range-led index starts on one tablet and splits as it grows (or pre-split it)."
+                    rec += (" It is created pre-split (SPLIT AT VALUES) so it doesn't start on one tablet."
+                            if "SPLIT AT VALUES" in actions[0]["sql"] else
+                            " A range-led index starts on one tablet and splits as it grows (see the pre-split "
+                            "note in changes.sql for a large table).")
         inc = include_cols(t, g.get("accs") or [], cols) if actions and cols else None
         if inc:
-            actions[0]["sql"] = actions[0]["sql"][:-1] + f" INCLUDE ({', '.join(qi(c) for c in inc)});"
+            pn, pt, pk_, _, prest = parse_create_index(actions[0]["sql"])
+            actions[0]["sql"] = (f"CREATE INDEX IF NOT EXISTS {pn} ON {pt} ({pk_}) "
+                                 f"INCLUDE ({', '.join(qi(c) for c in inc)})" + (f" {prest}" if prest else "") + ";")
             rec += f" INCLUDE ({', '.join(inc)}) lets the SELECT run as an Index Only Scan."
             pkc = [c for c in inc if t["pk"] and c in _index_cols(t, t["pk"])]
             if pkc:
@@ -2434,8 +2680,8 @@ def rule_settings(m, F):
 
 RULES = [rule_no_pk, rule_invalid, rule_hash_on_range_type, rule_monotonic_range, rule_lowcard_hash,
          rule_skew_or_nulls, rule_range_tails, rule_presplit, rule_partial, rule_redundant, rule_pk_range_twin,
-         rule_fk, rule_int_sequences, rule_gin, rule_analyze, rule_unused, rule_inefficient_statements,
-         rule_statement_access, rule_settings]
+         rule_fk, rule_int_sequences, rule_gin, rule_analyze, rule_unused, rule_statement_access,
+         rule_inefficient_statements, rule_settings]
 
 
 # --------------------------------------------------------------------------- validation & output
@@ -2496,6 +2742,7 @@ def main():
     for rule in RULES:
         rule(m, F)
     findings = F.sorted()
+    resolve_links(findings)
     # every finding about an existing index carries its current definition (shown in the report)
     defs = {i["fq"]: i["definition"] for i in m.indexes}
     for f in findings:

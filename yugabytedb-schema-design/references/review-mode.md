@@ -251,7 +251,7 @@ re-review, a second run was a no-op, and `rollback.sql` restored the exact origi
 | `low-cardinality-hash` | stats (n_distinct ≤ 64) or schema (boolean/enum); a HASH-led `smallint` without stats is a low-confidence candidate. Not raised when the HASH columns are the whole key of the PK or a unique index (one hash value per row), when the estimated distinct count is at least half the rows (unique in practice), or for tables under 1,000 rows. Replacement: `(col ASC)` + `SPLIT AT VALUES`, with an A1 bucket on a following monotonic column | [low-cardinality.md](low-cardinality.md) |
 | `null-heavy-hash`, `skewed-hash` | stats (null_frac, MCV freq) | [partial-indexes.md](partial-indexes.md) |
 | `range-hot-tails` | schema/stats: low-cardinality or skewed (one value ≥ 30% of rows) leading range column followed by a monotonic column (identity, sequence, `now()` default, or a created/modified/updated/`_date` name, snake_case or camelCase), or by a range PK suffix. Options bucket on the PK | [low-cardinality.md](low-cardinality.md) |
-| `range-single-tablet` | stats: range-sharded, 1 tablet, ≥ 100k rows | [low-cardinality.md](low-cardinality.md) |
+| `range-single-tablet` | stats: range-sharded, 1 tablet, ≥ 100k rows. Offers a pre-split rebuild (`SPLIT AT VALUES`) and swap, or `yb-admin split_tablet` for a PK / unique index. When the stats can't give the split points, it includes a query that computes them, plus a rebuild template | [low-cardinality.md](low-cardinality.md) |
 | `partial-keyed-on-predicate` | schema | [partial-indexes.md](partial-indexes.md) |
 | `partial-index-parameterized` | workload, **low confidence** (see limits) | [partial-indexes.md](partial-indexes.md) |
 | `redundant-index` | schema | [index-design.md](index-design.md#redundant-indexes) |
@@ -260,8 +260,8 @@ re-review, a second run was a no-op, and `rollback.sql` restored the exact origi
 | `fk-without-index`, `fk-type-mismatch` | schema/stats | [foreign-keys.md](foreign-keys.md) |
 | `int-sequence` | schema | [hotspots.md](hotspots.md) |
 | `multi-column-gin` | schema | [index-design.md](index-design.md) |
-| `scan-heavy-statement` | workload (`docdb_rows_scanned` ≥ 50× rows returned) | [index-design.md](index-design.md) |
-| `statement-no-index` | workload: a statement's equality/range conditions match no leading PK or index column (full scan). Names an index that would serve if a leading column such as `tenant_id` were added to the query | [index-design.md](index-design.md) |
+| `scan-heavy-statement` | workload (`docdb_rows_scanned` ≥ 50× rows returned and ≥ 100 per call). Shows the statement. Links to the statement finding that proposes the fix; otherwise says why it reads that much: a small table (low severity, no change), what the best index leaves to filtering (casts, NOT IN / !=, JSON fields, OR, LIKE), IN lists ahead of ORDER BY … LIMIT, or an aggregate | [index-design.md](index-design.md) |
+| `statement-no-index` | workload: a statement's equality/range conditions match no leading PK or index column (full scan). Names an index that would serve if a leading column such as `tenant_id` were added to the query. Low-cardinality filters alone get no index unless the table has ≥ 100k rows and one call would read ≤ 10% of it (1/distinct per column) | [index-design.md](index-design.md) |
 | `hash-key-partly-bound` | workload: a multi-column HASH key with only some HASH columns bound by equality, and no other index serves the statement | [sharding.md](sharding.md) |
 | `range-on-hash-column` | workload: range filter or `ORDER BY ... LIMIT` on a non-date/time HASH column that no index has as a range column (date/time: `hash-on-range-type`) | [sharding.md](sharding.md) |
 | `statement-weak-index` | workload: the best index binds only part of the equality conditions; reported only for statements at medium cost or above | [index-design.md](index-design.md) |
@@ -318,8 +318,25 @@ A proposal also counts as covered by a primary key another finding reshapes (the
 the old one). When a proposal fully covers an existing plain secondary index (same HASH part, the
 old key a prefix, its INCLUDE columns contained), the finding drops the old index in the `drop`
 phase, after the new one is built, so no access path ends up with two indexes.
-A range-led index starts on one tablet and splits as it grows; pre-split it if it will be large
-from day one.
+A range-led index starts on one tablet and splits as it grows, and a small index can stay below the
+split size threshold for a long time. So a workload index on a table with 100k rows or more is
+pre-split:
+- **Split points.** Leading key columns that hold one value (e.g. a single `tenant_id`) form a
+  fixed prefix, and the points come from the next column, e.g. `SPLIT AT VALUES (('1', '6401'),
+  ('1', '6501'))`.
+- **Count and order.** There is at most one point per node beyond the first, chosen so each slice
+  holds about the same share of rows (by MCV frequency; enum labels without frequencies are evenly
+  spaced). Points are listed in the key's order,
+  descending for a DESC column.
+- **No stats values.** High-cardinality columns under `values_mode=lowcard` have none. The note
+  then carries an `ntile()` query that computes the points from the data, and the `SPLIT AT`
+  template to append.
+- **Clause order.** `SPLIT AT` goes after `INCLUDE` and before a partial index's `WHERE`, as YSQL
+  requires.
+- **Time columns.** For a column that grows with inserts, splitting spreads the existing rows only.
+  New rows still land on the newest tablet (see `range-hot-tails`).
+- **Not split:** colocated tables (they can't be split) and partitioned parents (split each
+  partition's index instead). Split points stop at the first expression key, such as a bucket.
 
 A statement whose time is explained by one block scanning a whole table (`statement-no-index`,
 `hash-key-partly-bound`) does not also raise `statement-weak-index` for its other blocks.
@@ -357,6 +374,10 @@ to the `prepare` phase.
   defaults and names.
 - **`num_tablets` can be stale.** Confirm tablet counts with `yb-admin list_tablets` before acting
   on `range-single-tablet`.
+- **The scan-heavy explanation is a text heuristic.** It matches the statement against the
+  catalog: the best index's reach, plus NOT IN / != / JSON / OR / LIKE found in the WHERE text.
+  Confirm it with EXPLAIN (ANALYZE, DIST). The counters cover the whole statement window, so an
+  index created during it still shows the earlier scans.
 - **Expression keys** get no column statistics, so only type-based checks apply.
 - **Reversed indexes** (`a DESC` vs `a ASC`) are conservatively not reported as redundant.
 
