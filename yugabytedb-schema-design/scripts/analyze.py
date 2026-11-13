@@ -2,8 +2,10 @@
 """
 Offline YugabyteDB schema review.
 
-Reads a review bundle and writes findings.json, report.html (or report.md), changes.sql and rollback.sql
-(the last three via render.py, which re-renders them after triage).
+Reads a review bundle and writes findings.json, report.html (or report.md) and two change sets with
+their undo: changes-minimal.sql / rollback-minimal.sql and changes-ideal.sql / rollback-ideal.sql
+(the report and SQL via render.py, which re-renders them after triage). The minimal set fixes access
+paths and waste; the ideal set also removes write hot spots (bucket prefixes, HASHing monotonic keys).
 Never connects to a database and never executes DDL. Python 3.8+, stdlib only.
 
     python3 analyze.py BUNDLE_DIR [--out OUT_DIR] [--format html|md]
@@ -34,7 +36,7 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 # --------------------------------------------------------------------------- thresholds
 
@@ -426,11 +428,17 @@ class Model:
 
     def split_values(self, t, keycol):
         """Known values for SPLIT AT VALUES (all but the smallest), or None."""
+        vals = self.known_values(t, keycol)
+        return vals[1:] if vals and len(vals) > 1 else None
+
+    def known_values(self, t, keycol):
+        """Every value of a low-cardinality key column in sort order (boolean, enum labels, or the
+        MCVs from pg_stats), or None."""
         col = self.table_col(t, keycol)
         if col is None:
             return None
         if col["base_type"] == "boolean":
-            return ["true"]                    # false < true: one split, one tablet per value
+            return ["false", "true"]           # false < true
         labels = self.enums.get(col["type"]) or self.enums.get(col["base_type"])
         if labels:
             vals = labels                      # enum sort order = declared order
@@ -449,7 +457,7 @@ class Model:
                     return None
             else:
                 vals = sorted(vals)            # verify against the column collation
-        return vals[1:] if len(vals) > 1 else None
+        return vals
 
     def table_named(self, name):
         """A table referenced in a statement as name or schema.name (lower-cased), if unambiguous."""
@@ -546,7 +554,7 @@ def stmt_ref(stmts, n=3):
              "query": s["query"][:1000]} for s in stmts[:n]]
 
 
-# ---- actions: the DDL behind each finding, rendered into changes.sql / rollback.sql by render.py
+# ---- actions: the DDL behind each finding, rendered into the change sets and their rollbacks by render.py
 #
 # phase    prepare (ANALYZE) | create (new indexes, online) | workload (indexes proposed from
 #          statement text, online) | drop (drops, swap replacements in) | rewrite (table rewrites:
@@ -554,6 +562,18 @@ def stmt_ref(stmts, n=3):
 # kind     create | drop | replace | alter | analyze | note
 # target   object the action creates/drops; `replaces` ties both halves of an index replacement
 #          to the original index so render.py can skip them when that index is dropped anyway
+
+# Two change sets come out of one review: "minimal" fixes access paths and waste but leaves write
+# hot spots as they are (no bucket prefixes, no HASHing a monotonic key); "ideal" also removes the
+# hot spots. main() runs the rules once per profile and merges the findings: actions that differ
+# carry "profile", and data["profiles"] explains each side.
+PROFILES = ("minimal", "ideal")
+PROFILE = "ideal"
+
+
+def ideal():
+    return PROFILE == "ideal"
+
 
 def act(phase, sql, kind, target=None, rollback=None, replaces=None, note=None):
     return {"phase": phase, "kind": kind, "sql": sql.rstrip(), "rollback": rollback,
@@ -689,24 +709,34 @@ def replace_index(i, keys, split="", note=None):
                 rollback=f"DROP INDEX IF EXISTS {iname(i)};\n{recreate_sql(i)}")]
 
 
+def bucket_hash_cols(t, i, k):
+    """What a bucket expression hashes: the primary key's columns, which differ per row. Rows
+    inserted in one transaction share now(), and a coarse or derived timestamp (a date, a deadline
+    computed as now() + interval) repeats too, so hashing the timestamp would put a whole batch in
+    one bucket. A unique index may only hash its own key columns, and a table may have no plain
+    primary key: then hash the growing column k. i is the index being rebuilt (a primary key here
+    means a new, non-unique secondary index)."""
+    pk = t["pk"]
+    unique = i["is_unique"] and not i["is_pk"]
+    if not unique and pk and pk["keys"] and all(c["attnum"] for c in pk["keys"]):
+        return ", ".join(c["expr"] for c in pk["keys"])
+    return k["expr"] if k["attnum"] else f"({k['expr']})"
+
+
 def bucket_keys(m, i, k, desc=False):
-    """A1 pattern: (yb_hash_code(col) % N) ASC, col, <rest of the key>."""
+    """A1 pattern: (yb_hash_code(<pk>) % N) ASC, col, <rest of the key> (see bucket_hash_cols)."""
     expr = k["expr"] if k["attnum"] else f"({k['expr']})"
     rest = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"] if c is not k]
     col = f"{expr} {'DESC' if desc else ('ASC' if k['opt'] == 'HASH' else k['opt'])}"
-    return ", ".join([f"(yb_hash_code({expr}) % {m.buckets}) ASC", col] + rest)
+    return ", ".join([f"(yb_hash_code({bucket_hash_cols(i['table'], i, k)}) % {m.buckets}) ASC", col] + rest)
 
 
 def inner_bucket(m, t, i, mono_key):
-    """Bucket expression for the 'bucket inside each value' pattern. Prefer the PK column: rows
-    inserted in one transaction share now(), so hashing the timestamp would put a whole batch in
-    one bucket. Fall back to the monotonic column. -> (sql, column label)"""
-    pk = t["pk"]
-    used = {c["attnum"] for c in i["keys"]}
-    if pk and pk["keys"] and pk["keys"][0]["attnum"] and pk["keys"][0]["attnum"] not in used:
-        col = pk["keys"][0]["expr"]
-    else:
-        col = mono_key["expr"] if mono_key["attnum"] else f"({mono_key['expr']})"
+    """Bucket expression for the 'bucket inside each value' pattern:
+    (low-card ASC, (yb_hash_code(<pk>) % N) ASC, ts ASC) (see bucket_hash_cols). Once the index
+    splits at the (value, bucket) boundaries, each bucket's writes go to their own tablet.
+    -> (sql, hashed columns)"""
+    col = bucket_hash_cols(t, i, mono_key)
     return f"(yb_hash_code({col}) % {m.buckets}) ASC", col
 
 
@@ -1078,7 +1108,7 @@ def pk_reshape(t, i, k):
 
 def rule_hash_on_range_type(m, F):
     for i in m.indexes:
-        if i["am"] != "lsm" or i["is_partition"] or not i["is_valid"]:
+        if i["am"] != "lsm" or i["is_partition"] or not i["is_valid"] or lead_fixed_by_predicate(i):
             continue
         t = i["table"]
         for pos, k in enumerate(i["keys"], 1):
@@ -1105,7 +1135,8 @@ def rule_hash_on_range_type(m, F):
             if others:
                 rec += ", keeping the high-cardinality equality columns as HASH and moving the time column to the range part"
             else:
-                rec += ". A leading range time column is a write hotspot: add a bucket prefix (pattern A1)"
+                rec += (". A leading range time column has one write tail: the minimal change accepts it, the ideal "
+                        "one adds a bucket prefix (pattern A1)")
             rec += ". Keep HASH only if every query is an exact-match lookup."
             if others:
                 hk = others[0]["expr"] + " HASH" if len(others) == 1 else \
@@ -1113,13 +1144,22 @@ def rule_hash_on_range_type(m, F):
                 rest = [key_sql(c) for c in i["keys"][i["hash_count"]:]]
                 keys = ", ".join([hk, key_sql(k, "DESC")] + rest)
                 split = ""
-            else:
+            elif ideal():
                 keys, split = bucket_keys(m, i, k, desc=True), bucket_split(m.buckets)
+            else:
+                keys = ", ".join([key_sql(k, "DESC")] + [key_sql(c) for c in i["keys"][i["hash_count"]:]])
+                split = ""
+            profiles = None if others else {
+                "minimal": f"Range column ({k['expr']} DESC): range filters and ORDER BY on {k['expr']} seek. "
+                           "New rows still land on the newest tablet (one write tail), like any range key on a "
+                           "time column.",
+                "ideal": f"A1 bucket prefix (N={m.buckets}) ahead of {k['expr']} DESC: writes spread over "
+                         f"{m.buckets} tablets; ORDER BY {k['expr']} … LIMIT merges {m.buckets} sorted streams."}
             if i["is_pk"]:
                 # keep the PK (changing it rewrites the table); add a range-capable index for the scans
                 new = f"{t['name']}_{(col['name'] if col else 'expr')}_range"[:63]
                 actions = [act("create", f"CREATE INDEX IF NOT EXISTS {qi(new)} ON {tname(t)} "
-                               f"({bucket_keys(m, i, k, desc=True) if not others else keys}){'' if others else split};",
+                               f"({keys}){split};",
                                "create", target=f"{t['schema']}.{new}",
                                rollback=f"DROP INDEX IF EXISTS {qi(t['schema'])}.{qi(new)};",
                                note="secondary index for range scans; the PK itself is unchanged"),
@@ -1135,7 +1175,8 @@ def rule_hash_on_range_type(m, F):
                   f"{what.capitalize()} {i['name']} on {t['fq']}: key position {pos} `{k['expr']}` is HASH.",
                   rec, REF["hotspots"], actions=actions, confidence="high" if used else "medium",
                   confirm=[] if used else [f"Are there range filters or ORDER BY on {t['fq']}.{k['expr']}?"],
-                  data={"definition": i["definition"], "range_statements": stmt_ref(used)})
+                  data={"definition": i["definition"], "range_statements": stmt_ref(used),
+                        **({"profiles": profiles} if profiles else {})})
 
 
 def _opts(i):
@@ -1348,7 +1389,7 @@ def rule_pk_range_twin(m, F):
 
 def rule_monotonic_range(m, F):
     for i in m.indexes:
-        if i["am"] != "lsm" or i["is_partition"] or not i["keys"]:
+        if i["am"] != "lsm" or i["is_partition"] or not i["keys"] or lead_fixed_by_predicate(i):
             continue
         t = i["table"]
         yb = (t.get("yb") if i["is_pk"] else i.get("yb")) or {}
@@ -1364,9 +1405,17 @@ def rule_monotonic_range(m, F):
         sev = "high" if conf == "high" else "medium"
         rec = (f"Every insert lands on the last tablet of {i['name']}; tablet splitting moves the hotspot, "
                f"it doesn't remove it. Options: HASH it if no range scans are needed; "
-               f"a bucket prefix ((yb_hash_code({k0['expr']}) % N) ASC, {k0['expr']} {k0['opt']}) with "
-               f"SPLIT AT VALUES (pattern A1); or lead with a high-cardinality HASH column.")
-        if i["is_pk"]:
+               f"a bucket prefix ((yb_hash_code({bucket_hash_cols(t, i, k0)}) % N) ASC, {k0['expr']} {k0['opt']}) "
+               "with SPLIT AT VALUES (pattern A1); or lead with a high-cardinality HASH column."
+               + (f" The bucket hashes the primary key, not {k0['expr']}: rows inserted in one transaction "
+                  "share now(), so hashing the timestamp would put a whole batch in one bucket."
+                  if bucket_hash_cols(t, i, k0) != k0["expr"] else ""))
+        profiles = {"minimal": f"No change: {i['name']} keeps `{k0['expr']} {k0['opt']}`, so inserts keep landing on "
+                               "its newest tablet. Fine while the insert rate fits one tablet leader; range scans "
+                               "and ORDER BY keep working as they do now."}
+        if not ideal():
+            actions = []
+        elif i["is_pk"]:
             rec += " Changing a PK rewrites the table."
             keys = ", ".join([key_sql(k0, "HASH")] + [key_sql(c) for c in i["keys"][1:]])
             if t["relkind"] == "p":
@@ -1389,7 +1438,12 @@ def rule_monotonic_range(m, F):
               rec, REF["hotspots"], actions=actions, confidence=conf,
               confirm=([] if conf == "high" else [f"Is {t['fq']}.{k0['expr']} set to the current time on insert or update?"])
               + ([f"Do queries range-scan or ORDER BY {t['fq']}.{k0['expr']}?"] if i["is_pk"] else []),
-              data={"definition": i["definition"]})
+              data={"definition": i["definition"], "profiles": dict(profiles, ideal=(
+                  f"HASH the primary key on {k0['expr']} (full table rewrite): inserts spread over all tablets; "
+                  "range scans and ORDER BY on the key lose their index order." if i["is_pk"] else
+                  f"A1 bucket prefix (N={m.buckets}): inserts spread over {m.buckets} tablets; ORDER BY "
+                  f"{k0['expr']} … LIMIT merges {m.buckets} sorted streams."
+                  + (" Unique index: rebuilt by hand (manual)." if i["is_unique"] else "")))})
 
 
 def rule_lowcard_hash(m, F):
@@ -1397,12 +1451,12 @@ def rule_lowcard_hash(m, F):
         if i["am"] != "lsm" or i["is_partition"] or not i["is_valid"] or not i["hash_count"]:
             continue
         t = i["table"]
-        if i["predicate"] and _fixed_by_predicate(i["predicate"], i["keys"][0]["expr"]):
+        if lead_fixed_by_predicate(i):
             continue                                   # reported by partial-keyed-on-predicate
         # a HASH key that is the whole key of a unique index (or the PK) has one hash value per row
         if (i["is_unique"] or i["is_pk"]) and i["hash_count"] == len(i["keys"]):
             continue
-        est, srcs = 1.0, set()
+        est, srcs, profiles = 1.0, set(), None
         for k in i["keys"][:i["hash_count"]]:
             nd, src = m.distinct(t, k)
             if nd is None:
@@ -1455,6 +1509,10 @@ def rule_lowcard_hash(m, F):
             range_cols = [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in i["keys"]]
             k1 = i["keys"][1] if len(i["keys"]) > 1 else None
             mono_next = k1 is not None and m.monotonic(t, k1)[0]
+            # a timestamp with no now() default (a deadline, due or scheduled time) is usually set
+            # to now() plus an interval: new rows still sort at the newest end of each value
+            likely = bool(k1 is not None and not mono_next and k1["attnum"] and k1["base_type"] in TIME_TYPES)
+            mono_next = mono_next or likely
             pk0 = pk["keys"][0] if pk and pk["keys"] else None
             split = split_clause([ql(v) for v in vals]) if vals and i["hash_count"] == 1 else ""
             rec = (f"All rows with one {hk} value share a hash code, so they sit on one tablet that can't split "
@@ -1466,17 +1524,24 @@ def rule_lowcard_hash(m, F):
                 bucketed = list(range_cols)
                 bucketed.insert(1, bexpr)
                 range_keys = ", ".join(bucketed)
-                rec += (f" with a bucket inside each value. `{k1['expr']}` follows it and only increases, and it comes before the primary-key "
+                grows = ("is a timestamp that usually grows with insert time (a deadline or due time is "
+                         "typically now() plus an interval)" if likely else "only increases")
+                rec += (f" with a bucket inside each value. `{k1['expr']}` follows it and {grows}, and it comes before the primary-key "
                         "suffix in the index key: every new row for a value sorts after all existing ones, so "
                         "writes go to that value's last tablet even after splits (the PK suffix only orders "
                         f"rows with the same {k1['expr']}). The generated index adds an A1 bucket on "
-                        f"{bcol} (N={m.buckets}) inside each value; once auto-split divides the index at bucket "
-                        "boundaries, each bucket's writes go to their own tablet (no pre-split needed). Cost: "
+                        f"{bcol} (N={m.buckets}) inside each value; once auto-split divides the index at the "
+                        "(value, bucket) boundaries, each bucket's writes go to their own tablet (no pre-split "
+                        "needed). Cost: "
                         f"`WHERE {hk} = … ORDER BY {k1['expr']} LIMIT n` merges N sorted streams (no sort from "
                         "v2025.2.1; older versions sort). Alternatives under manual decisions: a partial index "
-                        f"keyed on {k1['expr']} for the value the queries poll (typical for queue tables), or "
-                        "no bucket when the insert rate is low.")
-                note = f"A1 bucket on {bcol} (N={m.buckets}): {k1['expr']} is monotonic and precedes the PK suffix"
+                        f"keyed on {k1['expr']} for the value the queries poll (typical for queue tables), or no "
+                        "bucket when the insert rate is low."
+                        + (f" The bucket hashes the primary key ({bcol}), which differs per row: rows inserted in "
+                           f"one transaction share now(), so hashing {k1['expr']} would put a whole batch in one "
+                           "bucket." if bcol != k1["expr"] else ""))
+                note = (f"A1 bucket on {bcol} (N={m.buckets}): {k1['expr']} "
+                        + ("likely grows with inserts" if likely else "is monotonic") + " and precedes the PK suffix")
             elif pk_hash:
                 range_keys = ", ".join(range_cols)
                 rec += (" and pre-split on its values: the HASH primary-key suffix spreads entries within each "
@@ -1498,6 +1563,8 @@ def rule_lowcard_hash(m, F):
                 # bucketed keys: no SPLIT AT VALUES; auto-split divides at (value, bucket) boundaries,
                 # after which each bucket's writes go to their own tablet
                 bucketed_key = mono_next or not pk_hash
+                # the index is rebuilt in both change sets anyway (HASH -> range), so the bucket
+                # costs nothing extra there: same key in both
                 actions = replace_index(i, range_keys, "" if bucketed_key else split, note=note)
                 if mono_next:
                     rest = ", ".join(key_sql(c) for c in i["keys"][1:])
@@ -1517,13 +1584,17 @@ def rule_lowcard_hash(m, F):
               + (f", {int(rows):,} rows" if rows else "") + ".",
               rec, REF["lowcard"], actions=actions,
               confidence="high" if ev == "stats" else "medium",
-              confirm=[f"Which queries use {i['name']}, and do they also filter on a high-cardinality column?"],
-              data={"definition": i["definition"], "distinct_estimate": est})
+              confirm=[f"Which queries use {i['name']}, and do they also filter on a high-cardinality column?"]
+              + ([f"Does {t['fq']}.{k1['expr']} grow with insert time (e.g. now() plus an SLA)? If not, the "
+                  "no-bucket alternative is enough."] if likely else []),
+              data={"definition": i["definition"], "distinct_estimate": est,
+                    **({"profiles": profiles} if profiles else {})})
 
 
 def rule_skew_or_nulls(m, F):
     for i in m.indexes:
-        if i["am"] != "lsm" or i["is_partition"] or not i["is_valid"] or not i["keys"] or i["is_pk"]:
+        if (i["am"] != "lsm" or i["is_partition"] or not i["is_valid"] or not i["keys"] or i["is_pk"]
+                or lead_fixed_by_predicate(i)):
             continue
         k0 = i["keys"][0]
         if k0["opt"] != "HASH" or i["hash_count"] != 1:
@@ -1581,7 +1652,7 @@ def rule_range_tails(m, F):
     every new row of a value lands at the newest end of that value's range (one hot spot per value).
     Splits don't help: the monotonic column sorts before the PK suffix."""
     for i in m.indexes:
-        if i["am"] != "lsm" or i["is_partition"] or not i["keys"] or i["is_pk"]:
+        if i["am"] != "lsm" or i["is_partition"] or not i["keys"] or i["is_pk"] or lead_fixed_by_predicate(i):
             continue
         k0 = i["keys"][0]
         if k0["opt"] == "HASH":
@@ -1703,10 +1774,134 @@ def rule_presplit(m, F):
 
 
 def _fixed_by_predicate(pred, col):
+    """The predicate pins col to one value (col = const, col IS NULL/TRUE/FALSE, bare boolean)."""
+    if re.search(r"\bOR\b", pred, re.I):
+        return False
     c = r'"?%s"?' % re.escape(col)
-    return bool(re.search(r"\b%s\s*=\s*(?!\$)" % c, pred, re.I) or
+    return bool(re.search(r"\b%s(?:\)?::\w+(?:\s+varying)?)?\s*=(?!\s*(?:\$|ANY\b|SOME\b))" % c, pred, re.I) or
                 re.search(r"\b%s\s+IS\s+(NULL|TRUE|FALSE)\b" % c, pred, re.I) or
                 re.fullmatch(r"\(?\s*(NOT\s+)?%s\s*\)?" % c, pred.strip(), re.I))
+
+
+def lead_fixed_by_predicate(i):
+    """A partial index whose leading key column its own predicate pins to one value."""
+    k0 = i["keys"][0] if i["keys"] else None
+    return bool(i["predicate"] and k0 and k0["attnum"] and _fixed_by_predicate(i["predicate"], k0["expr"]))
+
+
+SOFT_DELETE_RE = re.compile(r"delet|archiv|remov|purg", re.I)
+
+
+def _same_rows_index(t, i, keys, full_ok=True):
+    """Another index on t whose key serves `keys` -> it, or None. It has i's predicate, or none when
+    full_ok (a full index serves the same lookups, just over every row)."""
+    shape = _key_shape(keys)
+    same = lambda p: re.sub(r"\W", "", p or "") == re.sub(r"\W", "", i["predicate"])
+    for j in t["indexes"]:
+        if j is i or j["am"] != "lsm" or not j["is_valid"] or j["is_partition"]:
+            continue
+        if not (same(j["predicate"]) or full_ok and not j["predicate"]):
+            continue
+        if all(c["attnum"] for c in j["keys"]) and _shape_covers(_key_shape(index_keys_sql(j)), shape):
+            return j
+    return None
+
+
+def partial_fixed_lead(m, F, i):
+    """partial-keyed-on-predicate: every entry carries the same leading key, so the column says
+    nothing and (HASH) puts the whole index on one tablet. Key columns after it -> drop the pinned
+    ones from the key (same rows, same lookups). Only pinned columns -> drop it, re-key it on the
+    primary key (same rows, spread), or for `col IS NULL` index the other side (IS NOT NULL)."""
+    t, pred = i["table"], i["predicate"]
+    k0 = i["keys"][0]
+    rest = [c for c in i["keys"] if not (c["attnum"] and _fixed_by_predicate(pred, c["expr"]))]
+    pinned = [c["expr"] for c in i["keys"] if c not in rest]
+    detail = (f"{i['name']} on {t['fq']} is keyed on {', '.join(f'`{c}`' for c in pinned)}, which WHERE {pred} "
+              "fixes to one value: every entry has the same leading key, so the key orders nothing"
+              + (" and HASH puts the whole index on one tablet" if k0["opt"] == "HASH" else "")
+              + ". The planner also drops the implied equality from the index condition (yugabyte-db#18888).")
+    ref = REF["partial"] + "#case-2-dominant-single-value-skewed-distribution"
+    if rest:
+        null_pinned = any(re.search(r'\b"?%s"?\s+IS\s+NULL\b' % re.escape(c), pred, re.I) for c in pinned)
+        unique_note = ("" if not i["is_unique"] else
+                       " Unique index: NULLs never conflict, so today it enforces nothing; the new key would start "
+                       "enforcing uniqueness of the remaining columns on these rows. Confirm that is intended."
+                       if null_pinned else
+                       " Unique index: the key without the pinned columns enforces the same rule on these rows.")
+        opt, _ = lead_opt(m, t, rest[0]["expr"]) if rest[0]["attnum"] else (rest[0]["opt"], "")
+        keys = ", ".join([key_sql(rest[0], "HASH" if opt == "HASH" else "ASC")] +
+                         [key_sql(c, "ASC" if c["opt"] == "HASH" else None) for c in rest[1:]])
+        other = _same_rows_index(t, i, keys)
+        if other:
+            F.add("partial-keyed-on-predicate", "medium", "schema", i["fq"],
+                  "Partial index keyed on its own predicate column", detail,
+                  f"{other['name']} already serves the same lookups ({keys})"
+                  + ("" if other["predicate"] else f"; it holds every row, {i['name']} only those WHERE {pred}")
+                  + f". Drop {i['name']}.", ref,
+                  actions=[act("drop", f"DROP INDEX IF EXISTS {iname(i)};", "drop", target=i["fq"],
+                               rollback=recreate_sql(i))],
+                  data={"definition": i["definition"], "covered_by": other["definition"]})
+            return
+        F.add("partial-keyed-on-predicate", "medium", "schema", i["fq"],
+              "Partial index keyed on its own predicate column", detail,
+              f"Drop {', '.join(pinned)} from the key: ({keys}) WHERE {pred} holds the same rows and serves the "
+              "same lookups." + unique_note, ref,
+              actions=([manual(f"CREATE UNIQUE INDEX IF NOT EXISTS {qi(i['name'][:59] + '_new')} ON {tname(t)} "
+                               f"({keys}){index_tail(i)};", note="unique index: verify, then swap it in by hand")]
+                       if i["is_unique"] else replace_index(i, keys)),
+              data={"definition": i["definition"]})
+        return
+    # the key is only the pinned column(s)
+    col = k0["expr"]
+    is_null = bool(re.search(r'\b"?%s"?\s+IS\s+NULL\b' % re.escape(col), pred, re.I))
+    st = m.colstat(t, col) or {}
+    share = st.get("null_frac") if is_null else None
+    soft = bool(SOFT_DELETE_RE.search(col))
+    most = share is not None and share >= 0.5
+    pk = t["pk"]
+    pk_keys = None
+    if pk and all(c["attnum"] for c in pk["keys"]):
+        pk_keys = index_keys_sql(pk) if pk["hash_count"] else \
+            ", ".join([key_sql(pk["keys"][0], "HASH")] + [key_sql(c) for c in pk["keys"][1:]])
+    drop = manual(f"DROP INDEX IF EXISTS {iname(i)};", target=i["fq"], kind="drop",
+                  note=f"option A: drop it (the rows WHERE {pred} are most of the table, or no query lists them alone)")
+    opts = []
+    if pk_keys and not _same_rows_index(t, i, pk_keys, full_ok=False):
+        rb = replace_index(i, pk_keys)
+        opts.append(manual(rb[0]["sql"] + "\n" + rb[1]["sql"],
+                           note="option B: re-key on the primary key: the same rows, spread across tablets; the "
+                                "new index takes over the old name"))
+    if is_null:
+        nn = (i["name"][:50] + "_notnull")
+        opts.append(manual(f"CREATE INDEX IF NOT EXISTS {qi(nn)} ON {tname(t)} ({qi(col)} ASC) "
+                           f"WHERE {qi(col)} IS NOT NULL;\nDROP INDEX IF EXISTS {iname(i)};",
+                           note=f"option C: queries look up the rows where {col} is set (e.g. by time): index "
+                                "those instead. New values land at the newest end, which is fine at the rate "
+                                "rows get this value (e.g. soft deletes)"))
+    why = (f"{share:.0%} of the rows match {pred} (pg_stats null_frac)." if share is not None else
+           f"{col} looks like a soft-delete marker, so the rows it lists (the live ones) are usually most of the "
+           "table." if soft else "")
+    has_b = bool(opts) and opts[0]["note"].startswith("option B")
+    opt_c = (f" If queries look up the rows where {col} is set, index those instead (option C)." if is_null else "")
+    also = (f" A query that also filters on other columns is served by an index on those columns; adding WHERE "
+            f"{pred} to that index keeps it small.")
+    if most or (share is None and soft):
+        rec = (f"Drop it (option A). {why} A scan through this index then reads about as much as a table scan, "
+               "and through one tablet." + also + opt_c)
+        actions = [drop] + opts
+    else:
+        rec = (("If the rows it lists are a minority (e.g. open or pending rows) and queries list them, re-key it "
+                "on the primary key (option B): the same rows, spread across tablets. Otherwise drop it (option A)."
+                if has_b else
+                "If no query lists these rows alone, drop it (option A); to keep it, key it on a column the queries "
+                f"filter on, WHERE {pred}.")
+               + (f" {why}" if why else "") + also + opt_c)
+        actions = (opts[:1] + [drop] + opts[1:]) if has_b else [drop] + opts
+    F.add("partial-keyed-on-predicate", "medium", "stats" if share is not None else "schema", i["fq"],
+          "Partial index keyed on its own predicate column", detail, rec, ref, actions=actions,
+          confirm=[f"Which queries filter WHERE {pred}, and on which other columns?",
+                   f"What share of {t['fq']} matches {pred}?"],
+          data={"definition": i["definition"]})
 
 
 def rule_partial(m, F):
@@ -1714,20 +1909,8 @@ def rule_partial(m, F):
         if not i["predicate"] or i["is_partition"] or not i["keys"]:
             continue
         t = i["table"]
-        k0 = i["keys"][0]
-        if k0["attnum"] and _fixed_by_predicate(i["predicate"], k0["expr"]):
-            pk_cols = ", ".join(key_sql(c) for c in t["pk"]["keys"]) if t["pk"] else "<high-cardinality col> HASH"
-            F.add("partial-keyed-on-predicate", "medium", "schema", i["fq"],
-                  "Partial index keyed on its own predicate column",
-                  f"{i['name']} on {t['fq']} is keyed on `{k0['expr']}`, which WHERE {i['predicate']} fixes to one value: "
-                  "every entry has the same leading key (one hash → one tablet if HASH) and the planner drops the "
-                  "implied equality from the index condition (yugabyte-db#18888).",
-                  "Key the partial index on the columns the queries filter or sort on, e.g. "
-                  f"(<high-cardinality col> HASH, <sort col> DESC) WHERE {i['predicate']}.",
-                  REF["partial"] + "#case-2-dominant-single-value-skewed-distribution",
-                  actions=[manual(replace_index(i, f"<filter col> HASH, <sort col> DESC")[0]["sql"],
-                                  note=f"replace the key with what the queries filter/sort on (PK is {pk_cols})")],
-                  data={"definition": i["definition"]})
+        if lead_fixed_by_predicate(i):
+            partial_fixed_lead(m, F, i)
         # parameterized predicate columns (statements are normalized: literals look like $n too)
         pcols = [c["name"] for c in t.get("columns") or [] if _fixed_by_predicate(i["predicate"], c["name"])]
         hits = []
@@ -2210,7 +2393,7 @@ def include_cols(t, accs, keycols):
 
 
 def workload_index(m, t, name, keys, cols, eq_cols):
-    """A CREATE INDEX proposed from statement text: runnable in its own changes.sql phase.
+    """A CREATE INDEX proposed from statement text: runnable in its own change-set phase.
     eq_cols: key columns the statements bind by equality (their order in the key is free). A
     range-led index on a large table is pre-split when stats give the points; otherwise the note
     carries the query that computes them (it would start on one tablet)."""
@@ -2446,7 +2629,7 @@ def rule_statement_access(m, F):
                     rec += (" It is created pre-split (SPLIT AT VALUES) so it doesn't start on one tablet."
                             if "SPLIT AT VALUES" in actions[0]["sql"] else
                             " A range-led index starts on one tablet and splits as it grows (see the pre-split "
-                            "note in changes.sql for a large table).")
+                            "note in the change set for a large table).")
         inc = include_cols(t, g.get("accs") or [], cols) if actions and cols else None
         if inc:
             pn, pt, pk_, _, prest = parse_create_index(actions[0]["sql"])
@@ -2725,17 +2908,11 @@ def write_outputs(out, b, m, findings, warnings, fmt="html"):
     return load_render().render_all(json.loads(json.dumps(doc, default=str)), out, fmt=fmt)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bundle", help="bundle directory (stats.json or schema.sql), or a schema.sql file")
-    ap.add_argument("--out", help="output directory (default: BUNDLE/review)")
-    ap.add_argument("--format", choices=["html", "md"], default="html",
-                    help="report format: html (default, self-contained report.html) or md (report.md)")
-    ap.add_argument("--database", help="keep only statements whose datname matches (statements files "
-                    "covering several databases; default: the database stats.json was exported from)")
-    ap.add_argument("--range-default", action="store_true",
-                    help="schema.sql only. By default, keys without HASH/ASC/DESC follow YugabyteDB's default: the first key column is HASH, the rest ASC. Pass this to treat them as range (ASC) instead, for clusters running with yb_use_hash_splitting_by_default = off (e.g. Enhanced PostgreSQL Compatibility).")
-    args = ap.parse_args()
+def analyze_profile(args, profile):
+    """Run every rule for one change-set profile on a fresh model (rules record proposed index
+    names and statement counts on the model) -> (bundle, model, sorted findings)."""
+    global PROFILE
+    PROFILE = profile
     b = Bundle(args.bundle, range_default=args.range_default, database=args.database)
     m = Model(b)
     F = Findings()
@@ -2748,15 +2925,69 @@ def main():
     for f in findings:
         if f["object"] in defs and "redundant" not in f["data"]:
             f["data"].setdefault("definition", defs[f["object"]])
+    return b, m, findings
+
+
+def merge_profiles(runs):
+    """One findings list from the minimal and ideal runs. Findings pair up by (rule, object, title)
+    and occurrence; an action found in only one run is tagged with that profile ("profile"), and a
+    recommendation that differs is kept per profile in data["profiles"] unless the rule wrote one."""
+    def keyed(fs):
+        seen, out = defaultdict(int), OrderedDict()
+        for f in fs:
+            k = (f["rule"], f["object"], f["title"])
+            out[(k, seen[k])] = f
+            seen[k] += 1
+        return out
+    sig = lambda a: (a["phase"], a["kind"], a["sql"])
+    mins, ideals = keyed(runs["minimal"]), keyed(runs["ideal"])
+    merged = []
+    for k, fi in ideals.items():
+        fm = mins.get(k)
+        if fm is None:
+            fi["actions"] = [dict(a, profile="ideal") for a in fi["actions"]]
+            merged.append(fi)
+            continue
+        in_min, in_ideal = {sig(a) for a in fm["actions"]}, {sig(a) for a in fi["actions"]}
+        fi["actions"] = ([a if sig(a) in in_min else dict(a, profile="ideal") for a in fi["actions"]]
+                         + [dict(a, profile="minimal") for a in fm["actions"] if sig(a) not in in_ideal])
+        if fm["recommendation"] != fi["recommendation"] and "profiles" not in fi["data"]:
+            fi["data"]["profiles"] = {"minimal": fm["recommendation"], "ideal": fi["recommendation"]}
+        merged.append(fi)
+    n = len(merged)
+    for k, fm in mins.items():
+        if k not in ideals:
+            n += 1
+            merged.append(dict(fm, id=f"F{n:03d}", actions=[dict(a, profile="minimal") for a in fm["actions"]]))
+    return merged
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("bundle", help="bundle directory (stats.json or schema.sql), or a schema.sql file")
+    ap.add_argument("--out", help="output directory (default: BUNDLE/review)")
+    ap.add_argument("--format", choices=["html", "md"], default="html",
+                    help="report format: html (default, self-contained report.html) or md (report.md)")
+    ap.add_argument("--database", help="keep only statements whose datname matches (statements files "
+                    "covering several databases; default: the database stats.json was exported from)")
+    ap.add_argument("--range-default", action="store_true",
+                    help="schema.sql only. By default, keys without HASH/ASC/DESC follow YugabyteDB's default: the first key column is HASH, the rest ASC. Pass this to treat them as range (ASC) instead, for clusters running with yb_use_hash_splitting_by_default = off (e.g. Enhanced PostgreSQL Compatibility).")
+    args = ap.parse_args()
+    runs = {p: analyze_profile(args, p) for p in PROFILES}
+    b, m, _ = runs["ideal"]
+    findings = merge_profiles({p: r[2] for p, r in runs.items()})
     warnings = validate(b, m)
     out = args.out or os.path.join(b.path, "review")
-    phases, n_manual = write_outputs(out, b, m, findings, warnings, args.format)
+    sets = write_outputs(out, b, m, findings, warnings, args.format)
     counts = defaultdict(int)
     for f in findings:
         counts[f["severity"]] += 1
     print(f"{len(findings)} findings ({', '.join(f'{v} {k}' for k, v in sorted(counts.items(), key=lambda x: SEV_ORDER[x[0]]))})")
-    print(f"changes.sql: {', '.join(f'{p} {n}' for p, n in phases.items()) or 'no changes'}, {n_manual} manual")
-    print(f"→ {out}/report.{args.format}, findings.json, changes.sql, rollback.sql")
+    for p, (phases, n_manual) in sets.items():
+        print(f"changes-{p}.sql: {', '.join(f'{ph} {n}' for ph, n in phases.items()) or 'no changes'}, "
+              f"{n_manual} manual")
+    print(f"→ {out}/report.{args.format}, findings.json, changes-{{minimal,ideal}}.sql, "
+          "rollback-{minimal,ideal}.sql")
     for x in warnings:
         print(f"warning: {x}", file=sys.stderr)
 

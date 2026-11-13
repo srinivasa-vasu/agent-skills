@@ -26,8 +26,10 @@ This skill covers **how to design schemas well** for YugabyteDB: the design patt
   (they have, or can produce, a schema dump / stats export / statements file). Read
   `references/review-mode.md` first. It covers the bundle, safety rules, the scripts, how to triage
   the analyzer's findings, and the rollout runbook. Never run DDL or `ANALYZE` against the user's
-  database. Changes go into `changes.sql` (phased, with `rollback.sql`), rendered from the
-  triaged `findings.json` so the SQL always matches the report. With statements
+  database. Changes go into two phased change sets with their rollbacks: `changes-minimal.sql`
+  (access paths and waste) and `changes-ideal.sql` (also removes write hot spots), rendered from the
+  triaged `findings.json` so the SQL always matches the report; where the two sets differ, the
+  report shows both, and a finding's `"profile"` moves it between them. With statements
   (`pg_stat_statements` or tserver `:13000/statements`), the analyzer also checks each query's
   conditions against the PK and indexes, weighted by calls and mean time; its proposed indexes go
   in the runnable `workload` phase. A statements file spanning several databases needs
@@ -60,9 +62,9 @@ Read only the section(s) relevant to the user's question:
 
 - `scripts/collect.sh` — read-only collector: schema dump, `stats.json`, per-node `usage/*.json` (TLS: `--sslrootcert`)
 - `scripts/export-stats.sql` / `scripts/export-usage.sql` — the exports, runnable by hand with `ysqlsh`
-- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle or `schema.sql` → `findings.json`, `report.html` (`--format md` for `report.md`), `changes.sql`, `rollback.sql`; `--database NAME` keeps one database's statements
+- `scripts/analyze.py` — offline analyzer (stdlib Python): bundle or `schema.sql` → `findings.json`, `report.html` (`--format md` for `report.md`), `changes-{minimal,ideal}.sql`, `rollback-{minimal,ideal}.sql`; `--database NAME` keeps one database's statements
 - `scripts/schema_sql.py` — parses `schema.sql` (ysql_dump or hand-written DDL) into the catalog, for schema-only review (`analyze.py schema.sql`)
-- `scripts/render.py` — re-renders the report / `changes.sql` / `rollback.sql` from a triaged `findings.json`
+- `scripts/render.py` — re-renders the report and both change sets from a triaged `findings.json`
 - `scripts/checks/*.sql` — standalone live checks: `hash_on_range_type.sql`, `redundant_indexes.sql`
 
 ## Quick Decision Guide
@@ -92,7 +94,8 @@ Read only the section(s) relevant to the user's question:
 ✅ Lead with a low-cardinality or skewed column (few tenants) as range (ASC), not HASH: it splits inside a value; check pg_stats, else follow the schema's existing pattern
 ✅ INCLUDE the primary key columns a query selects: the PK in an index entry is encoded and not readable
 ✅ Index every foreign key column in child tables (a PK whose leading column is the FK counts)
-✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate
+✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate (never (deleted_at) WHERE deleted_at IS NULL)
+✅ Bucket inside a low-cardinality value when a growing timestamp follows it, hashing the primary key: (status ASC, (yb_hash_code(id) % 3) ASC, created_at ASC)
 ✅ Match FK column types exactly (INT vs BIGINT matters)
 ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
 ✅ Keep one copy of a key: a range index on exactly the HASH PK's columns ((tenant_id, id) HASH + (tenant_id ASC, id ASC)) doubles every write; reshape the PK (leading column by stats, else the existing pattern) and drop the index, or drop the index if every query binds the full key

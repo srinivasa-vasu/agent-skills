@@ -106,6 +106,26 @@ CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_active ON orders(customer_id, created_at DESC)
 WHERE status = 'active';
 -- Small, fast, never includes historical noise
+
+-- ❌ Keyed on the soft-delete column itself: every entry's key is NULL
+CREATE INDEX idx_orders_deleted_at ON orders(deleted_at HASH) WHERE deleted_at IS NULL;
+-- One key value → one hash → one tablet, and it lists the live rows: usually most of the table.
+```
+
+Fixes for an index keyed only on its predicate column, in order of how often they apply:
+
+```sql
+-- A. Drop it. The live rows are most of the table, so reading them through the index costs about
+--    as much as a table scan. Put the predicate on the indexes the queries really use instead:
+DROP INDEX idx_orders_deleted_at;
+CREATE INDEX idx_orders_customer_live ON orders(customer_id, created_at DESC) WHERE deleted_at IS NULL;
+
+-- B. The matching rows are a minority that queries list (open tickets, pending jobs):
+--    keep the predicate, key it on the primary key so the rows spread across tablets.
+CREATE INDEX idx_tickets_open ON tickets(id HASH) WHERE closed_at IS NULL;
+
+-- C. Queries look up the rows where the column IS set (purge or audit by time): index those.
+CREATE INDEX idx_orders_deleted ON orders(deleted_at ASC) WHERE deleted_at IS NOT NULL;
 ```
 
 ---

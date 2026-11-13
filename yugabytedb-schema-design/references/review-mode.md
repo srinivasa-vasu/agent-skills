@@ -7,8 +7,8 @@ same analyzer, so findings are identical and repeatable.
 ```
 live:     collect.sh ──┐
 offline:  customer ────┴──> bundle/ ──> analyze.py ──> findings.json ──> render.py ──> report.html
-                                                          ▲                          changes.sql
-                                                          └── you triage ────────────  rollback.sql
+                                                          ▲                          changes-{minimal,ideal}.sql
+                                                          └── you triage ────────────  rollback-{minimal,ideal}.sql
                                                               (status, review_note, edited SQL)
 ```
 
@@ -19,7 +19,8 @@ offline:  customer ────┴──> bundle/ ──> analyze.py ──> fin
 - Connect with a **read-only role**. The export scripts also set `default_transaction_read_only`
   and a `statement_timeout`.
 - **Never execute DDL** (CREATE/DROP/ALTER INDEX, ALTER TABLE). Recommendations go to
-  `changes.sql` (with `rollback.sql`) for the customer to run after review.
+  the change sets (`changes-minimal.sql` / `changes-ideal.sql`, each with its rollback) for the
+  customer to run after review.
 - **Never run `ANALYZE` without asking.** It's a write and can be heavy on big tables.
 - **No `EXPLAIN ANALYZE` on production without consent.** It executes the query. Plain `EXPLAIN` is fine.
 - Export scripts never read table rows. `pg_stats` sample values are limited (see `values_mode`);
@@ -34,7 +35,7 @@ offline:  customer ────┴──> bundle/ ──> analyze.py ──> fin
 | `stats.json` | `scripts/export-stats.sql` (one node) | **required**: catalog, sharding, pg_stats, tablets | `schema`, `stats` |
 | `usage/<node>.json` | `scripts/export-usage.sql` (**every** node) | unused indexes, pg_stat_statements with DocDB metrics | `workload` |
 | `statements/*.json` | tserver `:13000/statements` per node, or a consolidated file | workload checks when `usage/` has no statements | `workload` |
-| `schema.sql` | `ysql_dump --schema-only --include-yb-metadata` | reading DDL, replay; not parsed by the analyzer | — |
+| `schema.sql` | `ysql_dump --schema-only --include-yb-metadata` | reading DDL, replay; the analyzer's input when there is no `stats.json` (schema-only review) | `schema` |
 
 **Evidence levels** in every finding:
 - **schema**: derived from DDL alone. A candidate, it needs confirmation.
@@ -126,7 +127,7 @@ python3 scripts/analyze.py schema.sql --range-default   # override: keys without
 
 - **Best input:** `ysql_dump --schema-only --include-yb-metadata`. It spells out HASH/ASC/DESC,
   SPLIT clauses and colocation, so the review matches the live catalog. Tested: parsed dumps gave
-  the same findings and the same `changes.sql` as the live catalog of the same schema.
+  the same findings and the same change sets as the live catalog of the same schema.
 - **Hand-written DDL / migration scripts** also work: inline `PRIMARY KEY` / `UNIQUE` /
   `REFERENCES`, `SERIAL`, `SET search_path`, enums and domains. Keys without HASH/ASC get
   YugabyteDB's default: first key column HASH, the rest ASC. If the cluster runs with
@@ -157,12 +158,13 @@ Use the same YugabyteDB major version as the source.
 ## Running the Analyzer
 
 ```bash
-python3 scripts/analyze.py bundle            # writes bundle/review/{findings.json,report.html,changes.sql,rollback.sql}
+python3 scripts/analyze.py bundle            # writes bundle/review/: findings.json, report.html,
+                                             #   changes-{minimal,ideal}.sql, rollback-{minimal,ideal}.sql
 python3 scripts/analyze.py bundle --format md   # report.md instead of report.html
 python3 scripts/analyze.py bundle --out out/
 ```
 
-Stdlib only (Python 3.8+). It never connects to a database. The report is `report.html` by default: one self-contained file (no external CSS/JS), with severity filters and collapsible SQL, that can be emailed as is. `--format md` writes `report.md`; `render.py` takes the same option. Run it with `python3 -I` when the
+Stdlib only (Python 3.8+). It never connects to a database. The report is `report.html` by default: one self-contained file (no external CSS/JS), with severity filters, collapsible SQL and collapsible finding groups (groups with more than 10 findings start collapsed; a collapsed group is listed once, in the findings table, and its cards appear below when expanded; Expand all / Collapse all at the top; finding ids anywhere in the report link to their card, and links and the browser's find-in-page open a collapsed group), that can be emailed as is. `--format md` writes `report.md`; `render.py` takes the same option. Run it with `python3 -I` when the
 bundle came from outside.
 
 For a quick live check without a bundle, run the standalone queries in `scripts/checks/`:
@@ -188,29 +190,48 @@ The analyzer is deterministic. Your value is judgment. With the report / `findin
 5. **Collect the questions** (the report lists them) and ask the customer instead of guessing.
 6. **Record your triage in `findings.json`, then re-render** so the SQL matches the report:
    - `"status": "rejected"` + `"review_note": "why"` for false positives or changes the customer
-     declines. Rejected findings move to a "Rejected in review" section and leave `changes.sql`.
+     declines. Rejected findings move to a "Rejected in review" section and leave both change sets.
+   - `"profile": "ideal"` keeps a finding out of the minimal set; `"profile": "minimal"` makes the
+     ideal set use its minimal variant too (e.g. accept a hot spot the customer can live with).
    - `"status": "accepted"` for confirmed ones (`render.py --accepted-only` emits only these).
    - Edit an action's `"sql"` (and its `"rollback"`) to adjust a change: bucket count, INCLUDE
      columns, split points. To turn a manual item into a real change, set its `"phase"`.
    - Then: `python3 scripts/render.py bundle/review/findings.json`.
-   Never hand-edit `changes.sql` alone: the next render overwrites it, and it drifts from the report.
+   Never hand-edit a `changes-*.sql` file alone: the next render overwrites it, and it drifts from
+   the report.
 7. **Write the customer report**: summary, top 3–5 changes with impact and risk, the questions,
    the rollout plan below. The report already lists each finding's changes and their phase.
 
 ### The generated SQL
 
-`changes.sql` holds every change in the (triaged) report, grouped into phases, and runs **one
-phase per invocation**. Without `-v phase=...` it does nothing:
+The (triaged) report's changes come as **two change sets**; the customer runs one of them:
+
+| Set | Files | What it does |
+|---|---|---|
+| minimal | `changes-minimal.sql`, `rollback-minimal.sql` | Fixes access paths and waste: missing and redundant indexes, HASH on range-queried columns (→ plain `col DESC`), statistics, partial-index fixes, primary-key reshapes (rewrites included). Write hot spots of range keys stay as they are: a monotonic range index keeps its one write tail. |
+| ideal | `changes-ideal.sql`, `rollback-ideal.sql` | The same, plus removing write hot spots: A1 bucket prefixes on monotonic range keys and on HASH→range time columns, HASHing a monotonic primary key. (A low-cardinality HASH key gets its bucket inside each value in both sets: that index is rebuilt either way.) |
+
+Most findings are the same in both sets. Where they differ, the report shows both variants side by
+side with what each one costs; `findings.json` tags those actions with `"profile"` and explains them
+in `data.profiles`. The analyzer runs the rules once per set and merges them, so each set is
+deduplicated on its own (no index ends up covered by another, in either set), and each rollback
+undoes exactly its own set.
+
+Each file runs **one phase per invocation**. Without `-v phase=...` it does nothing:
 
 ```bash
-ysqlsh -d <db> -v phase=prepare -f changes.sql   # ANALYZE tables without statistics
-ysqlsh -d <db> -v phase=create  -f changes.sql   # FK indexes, replacement indexes (built online)
-ysqlsh -d <db> -v phase=workload -f changes.sql  # indexes proposed from statement text (built online)
+F=changes-minimal.sql                       # or changes-ideal.sql
+ysqlsh -d <db> -v phase=prepare -f $F       # ANALYZE tables without statistics
+ysqlsh -d <db> -v phase=create  -f $F       # FK indexes, replacement indexes (built online)
+ysqlsh -d <db> -v phase=workload -f $F      # indexes proposed from statement text (built online)
 #   ... verify plans and latency ...
-ysqlsh -d <db> -v phase=drop    -f changes.sql   # drop redundant indexes; swap replacements in
-ysqlsh -d <db> -v phase=rewrite -f changes.sql   # PK / column-type changes: full table rewrites,
-                                                 # maintenance window, writes stopped (#19860)
+ysqlsh -d <db> -v phase=drop    -f $F       # drop redundant indexes; swap replacements in
+ysqlsh -d <db> -v phase=rewrite -f $F       # PK / column-type changes: full table rewrites,
+                                            # maintenance window, writes stopped (#19860)
 ```
+
+Moving from minimal to ideal later works the same way: the ideal set's rebuilds are built as
+`<name>_new` and swapped in, so running it after the minimal set replaces the minimal variants.
 
 - **Replacements keep the original name.** A replacement index is built as `<name>_new` in
   `create`. In `drop`, the old index is dropped and the new one renamed, so hints and dashboards
@@ -225,20 +246,20 @@ ysqlsh -d <db> -v phase=rewrite -f changes.sql   # PK / column-type changes: ful
 - **Workload indexes are runnable, not commented out.** The indexes the statement checks propose
   have their own `workload` phase, with a checklist at its top and, under each index, the statements
   it serves (calls, mean time). Check each with `EXPLAIN (ANALYZE, DIST)` first; skip one by setting
-  its finding's `status` to `rejected` and re-rendering, not by editing `changes.sql`.
+  its finding's `status` to `rejected` and re-rendering, not by editing the `.sql` files.
 - **Manual decisions** (choices, unique-index reshapes, unused-index drops, range-tail options,
   templates with `<placeholders>`) are written commented out at the end, each with the questions to
   answer (`decide:`) before running it by hand.
 - **Inside each phase, changes run most severe first** (high → medium → low), under a `-- ---- high`
   / `medium` / `low` divider, also after triage edits reorder `findings.json`. Phases themselves keep
   their order: replacements are swapped in only after they are built, and rewrites run last.
-- `rollback.sql` undoes the phases in reverse (`rewrite` → `drop` → `workload` → `create`). Recreated indexes
+- Each rollback file undoes its own set's phases in reverse (`rewrite` → `drop` → `workload` → `create`). Recreated indexes
   come from `pg_get_indexdef`, which omits `SPLIT AT` clauses: re-add them from `schema.sql`.
-- All statements are idempotent (`IF [NOT] EXISTS`). YSQL has no `DROP INDEX CONCURRENTLY`; plain
-  `CREATE INDEX` already builds online outside a transaction block.
-
-Tested end to end: applying every phase on a test schema cleared all non-manual findings on
-re-review, a second run was a no-op, and `rollback.sql` restored the exact original schema.
+- Every phase is safe to re-run. Index statements use `IF [NOT] EXISTS`. A primary-key change
+  (a full table rewrite) runs only while the current key differs from its target (checked with
+  `pg_get_indexdef`; the file echoes "skipped" otherwise), so re-running the rewrite phase, or
+  running the ideal set after the minimal one, doesn't rewrite a table twice. YSQL has no
+  `DROP INDEX CONCURRENTLY`; plain `CREATE INDEX` already builds online outside a transaction block.
 
 ### Rule catalog
 
@@ -246,13 +267,13 @@ re-review, a second run was a no-op, and `rollback.sql` restored the exact origi
 |---|---|---|
 | `no-primary-key` | schema | [primary-keys.md](primary-keys.md) |
 | `invalid-index` | schema | [index-design.md](index-design.md) |
-| `hash-on-range-type` | schema → workload when range filters/ORDER BY on the column are seen | [hotspots.md](hotspots.md), [sharding.md](sharding.md) |
-| `monotonic-range-key` | schema (identity, sequence, `now()` default, or timestamp-like name) | [hotspots.md](hotspots.md) |
-| `low-cardinality-hash` | stats (n_distinct ≤ 64) or schema (boolean/enum); a HASH-led `smallint` without stats is a low-confidence candidate. Not raised when the HASH columns are the whole key of the PK or a unique index (one hash value per row), when the estimated distinct count is at least half the rows (unique in practice), or for tables under 1,000 rows. Replacement: `(col ASC)` + `SPLIT AT VALUES`, with an A1 bucket on a following monotonic column | [low-cardinality.md](low-cardinality.md) |
+| `hash-on-range-type` | schema → workload when range filters/ORDER BY on the column are seen. A leading HASH date/time column becomes a range column: `(col DESC)` in the minimal set, with an A1 bucket prefix on the primary key's hash in the ideal set; behind other HASH columns it moves to the range part (same in both). A HASH PK keeps its key and gets a secondary range index; reshaping the PK itself is a manual option | [hotspots.md](hotspots.md), [sharding.md](sharding.md) |
+| `monotonic-range-key` | schema (identity, sequence, `now()` default, or timestamp-like name). Minimal set: no change (the write tail is accepted). Ideal set: A1 bucket prefix rebuild `((yb_hash_code(<pk>) % N) ASC, col …) SPLIT AT VALUES ((1), …)`, hashing the primary key (a unique index hashes the column, its own key), or HASH for a primary key (table rewrite) | [hotspots.md](hotspots.md) |
+| `low-cardinality-hash` | stats (n_distinct ≤ 64) or schema (boolean/enum); a HASH-led `smallint` without stats is a low-confidence candidate. Not raised when the HASH columns are the whole key of the PK or a unique index (one hash value per row), when the estimated distinct count is at least half the rows (unique in practice), or for tables under 1,000 rows. Replacement: `(col ASC)` + `SPLIT AT VALUES`. When the next key column grows with inserts (monotonic, or any timestamp such as a deadline, with a confirm question), the replacement adds an A1 bucket on the primary key inside each value, in both change sets (the index is rebuilt either way): `(flag ASC, (yb_hash_code(id) % 3) ASC, ts ASC)`. The primary key differs per row; a timestamp repeats for rows inserted in one transaction. A unique index, or a table without a plain primary key, hashes the timestamp instead. No `SPLIT AT VALUES`: auto-split divides the index at the (value, bucket) boundaries, after which each bucket's writes go to their own tablet. The no-bucket variant stays as a manual alternative | [low-cardinality.md](low-cardinality.md) |
 | `null-heavy-hash`, `skewed-hash` | stats (null_frac, MCV freq) | [partial-indexes.md](partial-indexes.md) |
-| `range-hot-tails` | schema/stats: low-cardinality or skewed (one value ≥ 30% of rows) leading range column followed by a monotonic column (identity, sequence, `now()` default, or a created/modified/updated/`_date` name, snake_case or camelCase), or by a range PK suffix. Options bucket on the PK | [low-cardinality.md](low-cardinality.md) |
+| `range-hot-tails` | schema/stats: low-cardinality or skewed (one value ≥ 30% of rows) leading range column followed by a monotonic column (identity, sequence, `now()` default, or a created/modified/updated/`_date` name, snake_case or camelCase), or by a range PK suffix. Manual options: a bucket on the primary key inside each value, dropping the monotonic column, or (skewed) HASH on the leading column | [low-cardinality.md](low-cardinality.md) |
 | `range-single-tablet` | stats: range-sharded, 1 tablet, ≥ 100k rows. Offers a pre-split rebuild (`SPLIT AT VALUES`) and swap, or `yb-admin split_tablet` for a PK / unique index. When the stats can't give the split points, it includes a query that computes them, plus a rebuild template | [low-cardinality.md](low-cardinality.md) |
-| `partial-keyed-on-predicate` | schema | [partial-indexes.md](partial-indexes.md) |
+| `partial-keyed-on-predicate` | schema (stats: `null_frac` for `IS NULL`). The predicate pins the leading key column to one value (`= const`, `IS NULL`/`TRUE`/`FALSE`; not `= ANY (...)` or under OR). With more key columns: the rebuild drops the pinned ones, or the index is dropped when another index already serves that key. Key only the pinned column: option A drops it (first choice for soft-delete columns or when most rows match), option B re-keys it on the primary key (same rows, spread across tablets; first choice for a minority set like open rows), option C (`IS NULL` only) indexes `col IS NOT NULL` instead. Other sharding rules skip these indexes, so each gets one finding | [partial-indexes.md](partial-indexes.md) |
 | `partial-index-parameterized` | workload, **low confidence** (see limits) | [partial-indexes.md](partial-indexes.md) |
 | `redundant-index` | schema | [index-design.md](index-design.md#redundant-indexes) |
 | `pk-range-twin` | schema → workload: a secondary index on exactly the PK columns, range-sharded where the PK is HASH (`(tenant_id, id) HASH` PK + `(tenant_id ASC, id ASC)` index). Every row is written twice. If every statement on those columns binds the full key, drop the index (`drop`). Otherwise reshape the PK and drop the index (`rewrite`, full table rewrite): the leading column is decided like any proposal (stats, then existing indexes other than these twins): low-cardinality → `(tenant_id ASC, id ASC)`, high-cardinality → `(tenant_id HASH, id ASC)`, which serves both access paths. Other indexes the new PK covers are dropped with it; an index dropped as redundant *because of the twin* keeps its drop only if the new PK covers it too. Manual when FKs reference the PK, the table is partitioned, or another finding also reshapes that PK. Notes a per-tenant insert tail when the second column is monotonic | [index-design.md](index-design.md#redundant-indexes) |
@@ -280,7 +301,7 @@ Severity comes from the workload, so an unindexed lookup that costs nothing yet 
 | low | otherwise; also when stats.json shows the table under 1,000 rows (a large table, ≥ 1M rows, is at least medium) |
 
 Each finding lists its statements with calls, total and mean time and share of statement time, and a
-proposed index as a `manual` (commented-out) change: verify it with `EXPLAIN (ANALYZE, DIST)` first. A
+proposed index in the runnable `workload` phase: verify it with `EXPLAIN (ANALYZE, DIST)` first. A
 subquery is analysed as its own query block. A proposal is dropped (the finding points to the other
 index instead) when an existing index that no change drops or replaces, another finding's change,
 or a longer proposal on the same table has the same HASH columns and starts with its range columns.
@@ -378,6 +399,9 @@ to the `prepare` phase.
   catalog: the best index's reach, plus NOT IN / != / JSON / OR / LIKE found in the WHERE text.
   Confirm it with EXPLAIN (ANALYZE, DIST). The counters cover the whole statement window, so an
   index created during it still shows the earlier scans.
+- **A timestamp after a low-cardinality key column is assumed to grow with inserts** (deadlines
+  and due dates usually are `now()` plus an interval), so it gets a bucket inside each value. The
+  finding asks to confirm; when it doesn't grow, use the no-bucket alternative.
 - **Expression keys** get no column statistics, so only type-based checks apply.
 - **Reversed indexes** (`a DESC` vs `a ASC`) are conservatively not reported as redundant.
 
@@ -392,7 +416,8 @@ Offline review produces hypotheses, not proven fixes.
 2. **Validate on staging** with representative data. For each change, compare plans for the
    affected top statements with `EXPLAIN (ANALYZE, DIST)`: rows scanned, read requests, sort
    removed. For hotspot fixes, run a write load and confirm writes spread across tablet leaders.
-3. **Roll out in order of risk** (these are the `changes.sql` phases):
+3. **Pick the change set** (minimal or ideal, or minimal now and ideal later) and **roll out in
+   order of risk** (these are its phases):
    1. **prepare / create**: new and replacement indexes. `CREATE INDEX` builds online by default
       in YSQL (outside a transaction block); schedule large builds off-peak.
    2. **Verify** production plans pick them up.

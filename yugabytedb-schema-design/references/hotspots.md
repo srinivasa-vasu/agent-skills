@@ -39,7 +39,7 @@ index is created, with no `IN (...)` filter required in queries.
 ```sql
 -- ✅ Distribute across 3 physical shards, still sorted by timestamp within each shard
 CREATE INDEX idx_orders_created ON orders(
-    (yb_hash_code(created_at) % 3) ASC,   -- range-sharded synthetic prefix
+    (yb_hash_code(order_id) % 3) ASC,     -- range-sharded synthetic prefix (hash of the primary key)
     created_at DESC
 ) SPLIT AT VALUES ((1), (2));              -- N=3 → N-1=2 split points → 3 tablets
 
@@ -47,6 +47,14 @@ CREATE INDEX idx_orders_created ON orders(
 SELECT * FROM orders
 WHERE created_at >= NOW() - INTERVAL '1 month';
 ```
+
+**Hash the primary key, not the timestamp.** The primary key differs per row, so the buckets fill
+evenly. Rows with the same timestamp always share a bucket, and timestamps repeat more than they
+seem to: `now()` is fixed for a whole transaction, so a multi-row insert or a batch job puts every
+row in one bucket (one tablet), which is the hot spot again. Hash every column of a composite
+primary key (`yb_hash_code(tenant_id, id)`). Hashing the timestamp only helps exact-timestamp
+lookups, which can then compute their bucket. Exception: a **unique** index may only hash its own
+key columns, so hash the timestamp there.
 
 This works because YugabyteDB can **skip scan** a range-sharded prefix: it seeks to each bucket
 value and applies the `created_at` condition inside each one. (Skip scan is not available on a
@@ -84,9 +92,14 @@ No pre-split is needed here: once auto-split divides the index at `(status, buck
 each bucket's writes go to their own tablet. (Splitting only on the status values would not help
 on day one either: all buckets of a status would still share one tablet.)
 
-**Bucket on the primary key, not on the timestamp.** `now()` is fixed for a whole transaction, so
-rows inserted in one transaction share `created_at`: hashing it would put the whole batch in one
-bucket. The primary key differs per row.
+**Bucket on the primary key, not on the timestamp.** The primary key differs per row, so the
+spread is even. Rows with the same timestamp always land in the same bucket, and timestamps repeat
+more than they seem to: `now()` is fixed for a whole transaction (a multi-row insert or a batch job
+puts every row in one bucket), a deadline or due time computed as `now()` plus an interval repeats
+the same way, and a `date` or `timestamp(0)` column repeats for a whole day or second. Hashing the
+timestamp only helps queries that look rows up by exact timestamp, which this kind of index rarely
+serves. Hash every column of a composite primary key (`yb_hash_code(tenant_id, id)`).
+Exception: a **unique** index may only hash its own key columns, so hash the timestamp there.
 
 The same applies to booleans, small code columns, and a skewed tenant column with a modified
 timestamp:
@@ -107,7 +120,11 @@ See [low-cardinality.md](low-cardinality.md#why-range-sharding-works-here-the-hi
 
 Choose N based on expected write throughput (see table below). Keep N at a minimum equal to
 the replication factor (typically 3). The review analyzer (`scripts/analyze.py`) generates N =
-number of nodes, clamped to 3–12; adjust it in `findings.json` before rendering `changes.sql`.
+number of nodes, clamped to 3–12; adjust it in `findings.json` before rendering. It writes the
+A1 bucket prefix for monotonic range keys and for HASH date/time columns turned into range columns
+in the ideal change set only (`changes-ideal.sql`); the minimal set fixes the access path and
+leaves the write tail as it is. A bucket inside a low-cardinality value is in both sets, since
+that index is rebuilt either way.
 Physical shard boundaries cannot be changed manually after creation, but tablets will auto-split
 as data grows. Because the split points sit exactly on the bucket boundaries, each bucket gets
 its own tablet: the spread is even by construction, whatever the table's primary key is.
@@ -120,13 +137,13 @@ Prefix the index with a modulo-hash column to spread writes logically across N t
 ```sql
 -- ✅ Distribute the data logically into 'N' physical shards, still sorted by timestamp within each shard
 CREATE INDEX idx_orders_created ON orders(
-    (yb_hash_code(created_at) % 16) HASH,
+    (yb_hash_code(order_id) % 16) HASH,   -- hash of the primary key, as in A1
     created_at DESC
 );
 
--- Query must include the shard key filter (all values = full scan across all shards):
+-- Query must include the shard key filter, with the same expression (all values = every shard):
 SELECT * FROM orders
-WHERE yb_hash_code(created_at) % 16 IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+WHERE yb_hash_code(order_id) % 16 IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
   AND created_at >= NOW() - INTERVAL '1 month';
 ```
 

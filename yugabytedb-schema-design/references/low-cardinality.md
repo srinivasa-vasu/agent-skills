@@ -110,9 +110,11 @@ when new rows spread evenly across values and K ≥ node count; it's a hotspot w
 share one value (e.g. every new order is `'pending'`). Fixes: drop the monotonic column from the
 key if nothing sorts or filters on it (and rely on a HASH PK suffix), or bucket the monotonic
 column **inside** each value: `(status ASC, (yb_hash_code(order_id) % N) ASC, created_at ASC)`,
-bucketing on the primary key (a batch inserted in one transaction shares `now()`)
-([A1 inside a low-cardinality value](hotspots.md#a1-inside-a-low-cardinality-value)). Equality on
-`status` still seeks, and each value's new rows spread across N buckets.
+bucketing on the primary key, which differs per row, while rows inserted together share `now()`
+([A1 inside a low-cardinality value](hotspots.md#a1-inside-a-low-cardinality-value); a unique index
+hashes the timestamp instead). Equality on `status` still seeks, and each value's new rows spread across N buckets. No `SPLIT AT VALUES` is needed:
+auto-split divides the index at the `(value, bucket)` boundaries. This applies to any timestamp
+that grows with inserts, including deadlines and due dates (usually `now()` plus an interval).
 
 **Pre-split range indexes.** A new range-sharded index starts as **one tablet**. The suffix only
 helps after auto-splitting kicks in. Split points can be a prefix of the key, so splitting on
@@ -153,7 +155,8 @@ CREATE INDEX idx_active_users ON users(created_at DESC) WHERE is_active = true;
 -- ✅ If both values are queried: range-shard and pre-split on the boolean
 CREATE INDEX idx_active ON users(is_active ASC) SPLIT AT VALUES (('true'));
 -- false < true: one tablet per value from day one; a HASH PK suffix spreads each value further.
--- With a monotonic column after it, bucket on the PK: (is_active ASC, (yb_hash_code(user_id) % 3) ASC, created_at ASC)
+-- With a growing timestamp after it, bucket inside each value (no SPLIT AT; auto-split handles it):
+--   (is_active ASC, (yb_hash_code(user_id) % 3) ASC, created_at ASC)   -- user_id: the primary key
 
 -- ❌ Don't "fix" it by prefixing the PK column:
 CREATE INDEX idx_active ON users(user_id HASH, is_active);

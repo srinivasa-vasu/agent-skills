@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Render a schema review from findings.json: report.html (or report.md), changes.sql and rollback.sql.
+Render a schema review from findings.json: report.html (or report.md) and two change sets, each
+with its undo: changes-minimal.sql / rollback-minimal.sql and changes-ideal.sql / rollback-ideal.sql.
 
 analyze.py calls this automatically. Run it again after triage so the SQL matches the final
 report. Set a finding's "status" to "rejected" (and "review_note" to why), or edit an action's
@@ -9,6 +10,8 @@ report. Set a finding's "status" to "rejected" (and "review_note" to why), or ed
     python3 render.py REVIEW_DIR/findings.json [--out DIR] [--accepted-only] [--format html|md]
 
 Status values: proposed (default) | accepted | rejected. --accepted-only drops "proposed" too.
+A finding's "profile" moves it between the change sets: "ideal" keeps it out of the minimal set;
+"minimal" makes the ideal set use its minimal variant too.
 Stdlib only. Never connects to a database.
 """
 
@@ -35,11 +38,52 @@ WORKLOAD_NOTE = """\
 --      after creating it: the plan should use it and read fewer rows.
 --   2. Weigh the write cost: every index adds work to each INSERT/UPDATE/DELETE on the table.
 -- To skip one, set its finding's "status" to "rejected" in findings.json and re-render
--- (python3 render.py findings.json); don't edit this file by hand. Undo: rollback.sql phase=workload."""
+-- (python3 render.py findings.json); don't edit this file by hand. Undo: the rollback file's
+-- phase=workload."""
 REWRITE_WARNING = """\
 -- !! Each statement below rewrites a whole table. Run in a maintenance window with application
 -- !! writes stopped: concurrent DML during a YSQL table rewrite is not safe
 -- !! (https://github.com/yugabyte/yugabyte-db/issues/19860). Take a backup first."""
+
+
+PROFILES = ("minimal", "ideal")
+PROFILE_DESC = {
+    "minimal": "fixes access paths and waste (missing and redundant indexes, HASH on range-queried "
+               "columns, statistics, primary-key reshapes); leaves write hot spots of range keys as they are",
+    "ideal": "the same fixes, plus removing write hot spots (A1 bucket prefixes, HASHing monotonic keys)",
+}
+
+
+def in_profile(f, a, profile):
+    """Does action a of finding f belong to the change set `profile`?"""
+    override, ap = f.get("profile"), a.get("profile")
+    if override == "ideal" and profile == "minimal":
+        return False
+    if override == "minimal" and profile == "ideal":
+        return ap in (None, "minimal")
+    return ap in (None, profile)
+
+
+def profile_actions(f, profile):
+    return [a for a in f["actions"] if in_profile(f, a, profile)]
+
+
+def profile_text(f, profile):
+    """What the change set `profile` does for f, following a review override."""
+    prof = (f.get("data") or {}).get("profiles") or {}
+    override = f.get("profile")
+    if override == "ideal" and profile == "minimal":
+        return "Left out of this set in review (\"profile\": \"ideal\")."
+    if override == "minimal" and profile == "ideal":
+        return ("Uses the minimal variant, set in review (\"profile\": \"minimal\"). "
+                + (prof.get("minimal") or "")).strip()
+    return prof.get(profile) or ("No change." if not profile_actions(f, profile) else "")
+
+
+def differs(f):
+    """The two change sets treat f differently (shown side by side in the report)."""
+    return bool((f.get("data") or {}).get("profiles")) or any(a.get("profile") for a in f["actions"]) \
+        or f.get("profile") in PROFILES
 
 
 def included(f, accepted_only):
@@ -47,17 +91,17 @@ def included(f, accepted_only):
     return st == "accepted" or (st == "proposed" and not accepted_only)
 
 
-def plan(findings, accepted_only):
-    """Pick the actions to emit, resolving overlaps between findings.
+def plan(findings, accepted_only, profile="ideal"):
+    """Pick the actions of one change set to emit, resolving overlaps between findings.
 
     Returns (by_phase, manual, skipped): lists of (finding, action) plus skip notes."""
     # most severe first inside every phase; a stable sort keeps a finding's own actions in order
     active = sorted((f for f in findings if included(f, accepted_only)), key=lambda f: SEV_ORDER[f["severity"]])
     # indexes dropped outright: replacements of them are pointless
-    dropped = {a["target"]: f["id"] for f in active for a in f["actions"]
+    dropped = {a["target"]: f["id"] for f in active for a in profile_actions(f, profile)
                if a["kind"] == "drop" and a["phase"] == "drop"}
     # indexes the active phases drop or replace, and indexes that make a dropped index redundant
-    handled = {a["target"]: f["id"] for f in active for a in f["actions"]
+    handled = {a["target"]: f["id"] for f in active for a in profile_actions(f, profile)
                if a["phase"] == "drop" and a["kind"] in ("drop", "replace")}
     coverers = defaultdict(list)
     for f in active:
@@ -70,7 +114,7 @@ def plan(findings, accepted_only):
             skipped.append(f"CHECK: {idx} covers {', '.join(covered)} (dropped) and is itself changed by "
                            f"{handled[idx]}; confirm the new definition still serves their queries")
     for f in active:
-        for a in f["actions"]:
+        for a in profile_actions(f, profile):
             if a["phase"] == "manual":
                 if a["kind"] == "drop" and a.get("target") in handled:
                     skipped.append(f"{f['id']}: manual drop of {a['target']} omitted, "
@@ -134,6 +178,28 @@ def gate(phase_names, usage):
     return lines
 
 
+PK_ALTER_RE = re.compile(r"ALTER TABLE (\S+) DROP CONSTRAINT (\S+), ADD CONSTRAINT \S+ PRIMARY KEY \((.*)\);$", re.S)
+
+
+def guard_pk(sql):
+    """Run a primary-key change only while the key differs from the target, so re-running the
+    rewrite phase (or running the ideal set after the minimal one) doesn't rewrite the table again.
+    The check compares pg_get_indexdef without spaces; if it ever fails to match, the rewrite runs."""
+    m = PK_ALTER_RE.match(sql.strip())
+    if not m:
+        return sql
+    table, con, keys = m.groups()
+    schema = table.split(".")[0].strip('"') if "." in table else "public"
+    lit = lambda v: "'" + v.replace("'", "''") + "'"
+    target = "(" + re.sub(r"\s+", "", keys) + ")"
+    return (f"SELECT NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid "
+            f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = {lit(schema)} "
+            f"AND c.relname = {lit(con.strip(chr(34)))} AND strpos(regexp_replace(pg_get_indexdef(x.indexrelid), "
+            f"'\\s', '', 'g'), {lit(target)}) > 0) AS pk_change \\gset\n"
+            f"\\if :pk_change\n{sql}\n\\else\n\\echo '{table}: primary key already ({keys.replace(chr(39), '')}), skipped'\n"
+            "\\endif")
+
+
 def comment_block(sql):
     return "\n".join("-- " + line if line.strip() else "--" for line in sql.splitlines())
 
@@ -161,20 +227,23 @@ def statement_comments(f):
     return out
 
 
-def render_changes(doc, findings, accepted_only):
-    by_phase, manual, skipped = plan(findings, accepted_only)
+def render_changes(doc, findings, accepted_only, profile="ideal"):
+    by_phase, manual, skipped = plan(findings, accepted_only, profile)
     phase_names = [p for p, _ in PHASES]
-    L = header_lines(doc, findings, accepted_only, "changes")
-    L += ["--",
+    fn, other = f"changes-{profile}.sql", [p for p in PROFILES if p != profile][0]
+    L = header_lines(doc, findings, accepted_only, f"{profile} change set")
+    L += [f"-- {profile.capitalize()}: {PROFILE_DESC[profile]}.",
+          f"-- The other set is changes-{other}.sql. Run one of them, not both.",
+          "--",
           "-- Run the phases in order, verifying plans and latency between them (references/review-mode.md):"]
     for p, title in PHASES:
         n = len(by_phase.get(p, []))
-        L.append(f"--   ysqlsh -v phase={p:<8} -f changes.sql   {n:>3} change(s)  {title.split(':')[0]}")
+        L.append(f"--   ysqlsh -v phase={p:<8} -f {fn}   {n:>3} change(s)  {title.split(':')[0]}")
     L += ["-- Inside each phase, changes run most severe first: high, then medium, then low.",
           "-- workload: indexes proposed from statement text. Runnable; review each one first (see the phase).",
           "-- \"Manual decisions\" at the end are commented out: each needs a decision; run them by hand.",
-          "-- Undo with rollback.sql, phase by phase in reverse order.", ""]
-    L += gate(phase_names, "ysqlsh -v phase=prepare|create|workload|drop|rewrite -f changes.sql")
+          f"-- Undo with rollback-{profile}.sql, phase by phase in reverse order.", ""]
+    L += gate(phase_names, f"ysqlsh -v phase=prepare|create|workload|drop|rewrite -f {fn}")
     for p, title in PHASES:
         L += ["", f"-- {'=' * 96}", f"-- {title}", f"-- {'=' * 96}"]
         if p == "rewrite":
@@ -190,7 +259,7 @@ def render_changes(doc, findings, accepted_only):
             if f["severity"] != sev:
                 sev = f["severity"]
                 L += ["", f"-- ---- {sev} " + "-" * (90 - len(sev))]
-            L += ["", action_comment(f, a)] + statement_comments(f) + [a["sql"]]
+            L += ["", action_comment(f, a)] + statement_comments(f) + [guard_pk(a["sql"])]
         L += ["", f"\\echo 'phase {p}: done'", "\\endif"]
     L += ["", f"-- {'=' * 96}", "-- Manual decisions (commented out; need a choice or confirmation first)",
           f"-- {'=' * 96}", MANUAL_NOTE]
@@ -206,17 +275,18 @@ def render_changes(doc, findings, accepted_only):
     return "\n".join(L) + "\n"
 
 
-def render_rollback(doc, findings, accepted_only):
-    by_phase, _, _ = plan(findings, accepted_only)
+def render_rollback(doc, findings, accepted_only, profile="ideal"):
+    by_phase, _, _ = plan(findings, accepted_only, profile)
     order = ["rewrite", "drop", "workload", "create"]
-    L = header_lines(doc, findings, accepted_only, "rollback")
+    fn = f"rollback-{profile}.sql"
+    L = header_lines(doc, findings, accepted_only, f"rollback of the {profile} change set")
     L += ["--",
-          "-- Undo changes.sql phase by phase, in this order:"]
+          f"-- Undo changes-{profile}.sql phase by phase, in this order:"]
     for p in order:
-        L.append(f"--   ysqlsh -v phase={p:<8} -f rollback.sql")
+        L.append(f"--   ysqlsh -v phase={p:<8} -f {fn}")
     L += ["-- Recreated indexes come from pg_get_indexdef, which omits SPLIT AT/INTO clauses: re-add them",
           "-- from schema.sql (ysql_dump --include-yb-metadata) for range-sharded indexes.", ""]
-    L += gate(order, "ysqlsh -v phase=rewrite|drop|workload|create -f rollback.sql")
+    L += gate(order, f"ysqlsh -v phase=rewrite|drop|workload|create -f {fn}")
     for p in order:
         title = dict(PHASES)[p]
         L += ["", f"-- {'=' * 96}", f"-- Undo {title[0].lower() + title[1:]}", f"-- {'=' * 96}"]
@@ -227,7 +297,7 @@ def render_rollback(doc, findings, accepted_only):
         if not items:
             L.append("-- (nothing)")
         for f, a in items:
-            L += ["", f"-- undo {f['id']} {f['rule']}: {f['object']}", a["rollback"]]
+            L += ["", f"-- undo {f['id']} {f['rule']}: {f['object']}", guard_pk(a["rollback"])]
         L += ["", f"\\echo 'rollback {p}: done'", "\\endif"]
     return "\n".join(L) + "\n"
 
@@ -283,10 +353,10 @@ def type_counts(fs):
     return c
 
 
-REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (report.html and changes.sql have all)
+REPORT_SQL_LINES = 12      # longer change lists are truncated in report.md (report.html and the .sql files have all)
 PHASE_LABEL = {"prepare": "prepare", "create": "create", "workload": "workload (review each)", "drop": "drop",
                "rewrite": "rewrite",
-               "manual": "manual (commented out in changes.sql)"}
+               "manual": "manual (commented out in the change set)"}
 
 
 def current_section(data):
@@ -325,9 +395,22 @@ def statements_section(data):
     return L + [""]
 
 
-def changes_section(actions):
+def profile_sections(f, accepted_only=False):
+    """report.md: a finding's changes, once when both sets agree, else per set with its explanation."""
+    if not differs(f):
+        return changes_section(f["actions"]) if f["actions"] else []
+    L = []
+    for p in PROFILES:
+        acts = profile_actions(f, p)
+        L.append(f"**{p.capitalize()} (changes-{p}.sql):** {profile_text(f, p)}\n")
+        if acts:
+            L += changes_section(acts, title=None)
+    return L
+
+
+def changes_section(actions, title="**Changes:**\n"):
     """One line per phase (with statement count and distinct notes), then the SQL, capped."""
-    L = ["**Changes:**\n"]
+    L = [title] if title else []
     by_phase = defaultdict(list)
     for a in actions:
         by_phase[a["phase"]].append(a)
@@ -340,22 +423,35 @@ def changes_section(actions):
         L.append(f"- `{PHASE_LABEL[p]}`{count}" + (f": {'; '.join(notes)}" if notes else ""))
     lines = []
     for a in actions:
-        # the report shows the statements; changes.sql keeps the ysqlsh re-run guards (\gset, \if)
+        # the report shows the statements; the .sql files keep the ysqlsh re-run guards (\gset, \if)
         sql = "\n".join(line for line in a["sql"].splitlines()
                          if not line.lstrip().startswith("\\") and not line.rstrip().endswith("\\gset"))
         lines += (comment_block(sql) if a["phase"] == "manual" else sql).splitlines()
     if len(lines) > REPORT_SQL_LINES:
         more = len(lines) - REPORT_SQL_LINES
-        lines = lines[:REPORT_SQL_LINES] + [f"-- … {more} more line(s): see changes.sql"]
+        lines = lines[:REPORT_SQL_LINES] + [f"-- … {more} more line(s): see the change set files"]
     L.append("\n```sql\n" + "\n".join(lines) + "\n```\n")
     return L
+
+
+def set_counts(findings, accepted_only, profile):
+    by_phase, manual, _ = plan(findings, accepted_only, profile)
+    return (", ".join(f"{p} {len(by_phase[p])}" for p, _ in PHASES if by_phase.get(p)) or "no changes") \
+        + f", {len(manual)} manual"
+
+
+def skipped_all(findings, accepted_only):
+    """Overlap notes of both sets; a note that only one set has is labeled with it."""
+    per = {p: plan(findings, accepted_only, p)[2] for p in PROFILES}
+    both = [x for x in per["ideal"] if x in per["minimal"]]
+    return both + [f"[{p}] {x}" for p in PROFILES for x in per[p] if x not in both]
 
 
 def render_report(doc, findings, accepted_only):
     meta = doc.get("meta", {})
     live = [f for f in findings if f.get("status") != "rejected"]
     rejected = [f for f in findings if f.get("status") == "rejected"]
-    _, _, skipped = plan(findings, accepted_only)
+    skipped = skipped_all(findings, accepted_only)
     prev_rule = None
     L = [f"# YugabyteDB schema review: {meta.get('database')}\n",
          f"- Exported: {meta.get('exported_at')}  \n- Version: {meta.get('version')}  ",
@@ -383,10 +479,14 @@ def render_report(doc, findings, accepted_only):
             L.append(f"| {label} (`{rule}`) | {len(fs)} | " + " | ".join(str(c[s] or "") for s in SEV_ORDER) + " |")
     L.append("\nEvidence: **schema** = from DDL (candidate), **stats** = backed by pg_stats/row counts, "
              "**workload** = backed by statements/usage.\n")
-    L.append("Every change below is collected in **changes.sql** (run phase by phase) with its undo in "
-             "**rollback.sql**. Phases: `prepare` → `create` → `workload` → `drop` → `rewrite`. `workload` "
-             "holds the indexes proposed from statement text: runnable, but review each one first. Only "
-             "`manual` items, which need a decision or a placeholder filled, are commented out.\n")
+    L.append("The changes come as two sets; run one of them, phase by phase, with its own undo file:\n")
+    for p in PROFILES:
+        L.append(f"- **{p}** (`changes-{p}.sql`, `rollback-{p}.sql`): {PROFILE_DESC[p]}. "
+                 f"{set_counts(findings, accepted_only, p)}.")
+    L.append(f"\n{sum(1 for f in live if differs(f))} finding(s) differ between the sets; each shows both. "
+             "Phases: `prepare` → `create` → `workload` → `drop` → `rewrite`. `workload` holds the indexes "
+             "proposed from statement text: runnable, but review each one first. Only `manual` items, which "
+             "need a decision or a placeholder filled, are commented out.\n")
     L.append("## Findings\n")
     for f in [f for _, _, fs in group_findings(live) for f in fs]:
         if f["rule"] != prev_rule:
@@ -402,14 +502,13 @@ def render_report(doc, findings, accepted_only):
             L.append(f"**Review note:** {f['review_note']}\n")
         L += current_section(f.get("data") or {})
         L += statements_section(f.get("data") or {})
-        if f["actions"]:
-            L += changes_section(f["actions"])
+        L += profile_sections(f)
         if f["needs_confirmation"]:
             L.append("**Confirm:**\n")
             L += [f"- [ ] {q}" for q in f["needs_confirmation"]]
             L.append("")
     if rejected:
-        L.append("## Rejected in review (excluded from changes.sql)\n")
+        L.append("## Rejected in review (excluded from both change sets)\n")
         L += [f"- {f['id']} {f['rule']} `{f['object']}`: {f.get('review_note') or 'no note'}" for f in rejected]
         L.append("")
     if skipped:
@@ -429,7 +528,7 @@ def render_report(doc, findings, accepted_only):
         L.append("- No query hint (`pg_hint_plan` `IndexScan(t idx)`) or application code names it.")
         L.append("- Usage counters were collected on **every** node (they are per node) over a full business cycle.")
         L.append("- It doesn't back a constraint the application relies on (checked automatically for PK/UNIQUE/FK).")
-        L.append("- Keep rollback.sql; drop one index at a time on busy systems and watch latency.\n")
+        L.append("- Keep the rollback file; drop one index at a time on busy systems and watch latency.\n")
     top = doc.get("top_statements") or []
     if top:
         L.append(f"## Top {len(top)} statements by total time\n")
@@ -491,6 +590,8 @@ table.stmts td.q code { display: block; white-space: pre-wrap; overflow-wrap: an
 .finding.low { border-left-color: var(--low); }
 .finding .sub { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
 .finding .obj { font-weight: 400; }
+/* collapsed group (hidden="until-found" keeps the box for find-in-page): takes no space */
+.group[hidden] { border: 0; padding: 0; margin: 0; min-height: 0; height: 0; overflow: hidden; }
 .label { font-weight: 600; margin: 12px 0 4px; }
 .phases { margin: 4px 0; padding-left: 20px; } .phases li { margin: 2px 0; }
 .ph { font: 12px ui-monospace, Menlo, monospace; background: var(--code); border-radius: 4px; padding: 1px 6px; }
@@ -500,15 +601,63 @@ ul.check { list-style: none; padding-left: 4px; } ul.check li::before { content:
 .warn li { margin: 3px 0; }
 .accepted { color: var(--low); font-size: 13px; font-weight: 600; }
 .hidden { display: none; }
+.sets { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-top: 8px; }
+.set { border: 1px solid var(--border, #8884); border-radius: 8px; padding: 4px 12px 8px; min-width: 0; }
+.set p { margin: 4px 0 6px; }
+.pf { font: 12px ui-monospace, Menlo, monospace; color: var(--muted); font-weight: 400; margin-left: 6px; }
 h4 { font-size: 16px; margin: 0; }
 h3.grph { font-size: 17px; margin: 28px 0 4px; } h3.grph .cnt { color: var(--muted); font-weight: 400; }
 tr.grp td { background: var(--card); font-weight: 600; padding-top: 10px; }
 tr.grp td .cnt { color: var(--muted); font-weight: 400; }
+.fold, .grph .fold { cursor: pointer; display: inline-block; width: 18px; color: var(--muted); user-select: none; }
+tr.folded { display: none; }
+.foldall { margin: 6px 0 2px; } .foldall button { font: inherit; font-size: 13px; cursor: pointer; margin-right: 6px;
+  background: var(--card); color: inherit; border: 1px solid var(--border, #8884); border-radius: 6px; padding: 2px 10px; }
 .typetab td:nth-child(n+2), .typetab th:nth-child(n+2) { text-align: right; width: 70px; }
 footer { color: var(--muted); font-size: 13px; margin-top: 40px; }
 """
 
+FOLD_OVER = 10    # finding-type groups with more findings than this start collapsed in the HTML report
+
 HTML_JS = """
+function setFold(k, folded) {
+  document.querySelectorAll('[data-fold="' + k + '"]').forEach(function (b) { b.textContent = folded ? '\u25b8' : '\u25be'; });
+  document.querySelectorAll('tr[data-sev][data-grp="' + k + '"]').forEach(function (r) { r.classList.toggle('folded', folded); });
+  // a collapsed group's cards (and their heading) disappear: the index table above lists the group.
+  // hidden="until-found" keeps them reachable by find-in-page, which fires beforematch to unfold
+  document.querySelectorAll('.group[data-grp="' + k + '"]').forEach(function (g) {
+    g.classList.toggle('folded', folded);
+    if (folded) { g.setAttribute('hidden', 'until-found'); } else { g.removeAttribute('hidden'); }
+  });
+}
+document.addEventListener('beforematch', function (e) {
+  var g = e.target.closest && e.target.closest('.group');
+  if (g && g.classList.contains('folded')) { setFold(g.getAttribute('data-grp'), false); }
+});
+document.querySelectorAll('.fold[data-fold]').forEach(function (b) {
+  b.addEventListener('click', function (e) {
+    e.preventDefault();
+    var k = b.getAttribute('data-fold');
+    setFold(k, !document.querySelector('.group[data-grp="' + k + '"]').classList.contains('folded'));
+  });
+});
+document.querySelectorAll('.foldall button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var folded = b.getAttribute('data-act') === 'collapse';
+    document.querySelectorAll('.group[data-grp]').forEach(function (g) { setFold(g.getAttribute('data-grp'), folded); });
+  });
+});
+// a link to a finding or a group opens that group first
+function openFor(hash) {
+  var el = hash && document.getElementById(hash.slice(1));
+  var g = el && (el.closest('.group') || (el.parentElement && el.parentElement.closest('.group')));
+  if (g && g.classList.contains('folded')) { setFold(g.getAttribute('data-grp'), false); if (el.scrollIntoView) { el.scrollIntoView(); } }
+}
+document.querySelectorAll('a[href^="#"]').forEach(function (a) {
+  a.addEventListener('click', function () { setTimeout(function () { openFor(a.getAttribute('href')); }, 0); });
+});
+window.addEventListener('hashchange', function () { openFor(location.hash); });
+openFor(location.hash);
 document.querySelectorAll('.card[data-sev]').forEach(function (c) {
   c.addEventListener('click', function () {
     c.classList.toggle('off');
@@ -517,7 +666,7 @@ document.querySelectorAll('.card[data-sev]').forEach(function (c) {
       if (el !== c) el.classList.toggle('hidden', off);
     });
     // hide a finding-type group (and its index row) once all its findings are hidden
-    document.querySelectorAll('div.group').forEach(function (g) {
+    document.querySelectorAll('.group[data-grp]').forEach(function (g) {
       g.classList.toggle('hidden', g.querySelectorAll('section.finding:not(.hidden)').length === 0);
     });
     document.querySelectorAll('tr.grp').forEach(function (r) {
@@ -531,8 +680,9 @@ document.querySelectorAll('.card[data-sev]').forEach(function (c) {
 
 
 def _h(text):
-    """Escape, then render `code` spans."""
-    return re.sub(r"`([^`]+)`", r"<code>\1</code>", html.escape(str(text if text is not None else ""), quote=False))
+    """Escape, then render `code` spans and link finding ids (F012) to their cards."""
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", html.escape(str(text if text is not None else ""), quote=False))
+    return re.sub(r"\bF\d{3,}\b", lambda mm: f'<a href="#{mm.group(0)}">{mm.group(0)}</a>', out)
 
 
 def _sql_lines(actions):
@@ -542,6 +692,24 @@ def _sql_lines(actions):
                         if not line.lstrip().startswith("\\") and not line.rstrip().endswith("\\gset"))
         lines.append(comment_block(sql) if a["phase"] == "manual" else sql)
     return "\n".join(lines)
+
+
+def _changes_html(actions):
+    """A finding's changes: one line per phase with its notes, then the SQL."""
+    H = ['<ul class="phases">']
+    by_phase = defaultdict(list)
+    for a in actions:
+        by_phase[a["phase"]].append(a)
+    for p in ["prepare", "create", "workload", "drop", "rewrite", "manual"]:
+        acts = by_phase.get(p)
+        if acts:
+            notes = list(dict.fromkeys(a["note"] for a in acts if a.get("note")))
+            cnt = f" &times;{len(acts)}" if len(acts) > 1 else ""
+            H.append(f'<li><span class="ph">{html.escape(PHASE_LABEL[p])}</span>{cnt}'
+                     + (f": {_h('; '.join(notes))}" if notes else "") + "</li>")
+    H.append('</ul><details open><summary>SQL</summary><pre><code>'
+             + html.escape(_sql_lines(actions)) + "</code></pre></details>")
+    return H
 
 
 def short_version(v):
@@ -554,7 +722,7 @@ def render_report_html(doc, findings, accepted_only):
     meta = doc.get("meta", {})
     live = [f for f in findings if f.get("status") != "rejected"]
     rejected = [f for f in findings if f.get("status") == "rejected"]
-    _, _, skipped = plan(findings, accepted_only)
+    skipped = skipped_all(findings, accepted_only)
     counts = defaultdict(int)
     for f in live:
         counts[f["severity"]] += 1
@@ -583,11 +751,17 @@ def render_report_html(doc, findings, accepted_only):
     H.append('<p class="sub">Click a severity to show or hide it. Evidence: <b>schema</b> = from DDL '
              "(candidate), <b>stats</b> = backed by pg_stats/row counts, <b>workload</b> = backed by "
              "statements/usage.</p>")
-    H.append("<p>Every change is collected in <b>changes.sql</b> (run phase by phase: "
-             "<code>prepare</code> &rarr; <code>create</code> &rarr; <code>workload</code> &rarr; <code>drop</code> "
-             "&rarr; <code>rewrite</code>) with its undo in <b>rollback.sql</b>. <code>workload</code> holds the "
-             "indexes proposed from statement text: runnable, but review each one first. Only <code>manual</code> "
-             "items, which need a decision or a placeholder filled, are commented out.</p>")
+    H.append('<h3 class="grph">Change sets</h3><p>The changes come as two sets. Run one of them, phase by '
+             "phase (<code>prepare</code> &rarr; <code>create</code> &rarr; <code>workload</code> &rarr; "
+             "<code>drop</code> &rarr; <code>rewrite</code>), with its own undo file:</p><ul>")
+    for p in PROFILES:
+        H.append(f"<li><b>{p.capitalize()}</b>: <code>changes-{p}.sql</code> / <code>rollback-{p}.sql</code>: "
+                 f"{html.escape(PROFILE_DESC[p])}. <span class=\"sub\">{set_counts(findings, accepted_only, p)}"
+                 "</span></li>")
+    H.append(f"</ul><p>{sum(1 for f in live if differs(f))} finding(s) differ between the sets; each shows both "
+             "variants. <code>workload</code> holds the indexes proposed from statement text: runnable, but "
+             "review each one first. Only <code>manual</code> items, which need a decision or a placeholder "
+             "filled, are commented out.</p>")
 
     groups = group_findings(live)
     if groups:
@@ -605,13 +779,19 @@ def render_report_html(doc, findings, accepted_only):
         H.append("</ul>")
 
     if live:
-        H.append("<h2>Findings</h2><table><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Object</th>"
-                 "<th>Evidence</th></tr>")
+        H.append("<h2>Findings</h2>"
+                 '<div class="foldall"><button data-act="expand">Expand all</button>'
+                 '<button data-act="collapse">Collapse all</button>'
+                 f'<span class="cnt">groups with more than {FOLD_OVER} findings start collapsed</span></div>'
+                 "<table><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Object</th><th>Evidence</th></tr>")
         for rule, label, fs in groups:
-          H.append(f'<tr class="grp" data-grp="{rule}"><td colspan="5"><a href="#g-{rule}">{html.escape(label)}</a> '
+          folded = len(fs) > FOLD_OVER
+          H.append(f'<tr class="grp" data-grp="{rule}"><td colspan="5"><span class="fold" data-fold="{rule}">'
+                   f'{"&#9656;" if folded else "&#9662;"}</span><a href="#g-{rule}">{html.escape(label)}</a> '
                    f'<span class="cnt">({len(fs)})</span></td></tr>')
+          fold_cls = ' class="folded"' if folded else ""
           for f in fs:
-            H.append(f'<tr data-sev="{f["severity"]}" data-grp="{rule}"><td><a href="#{f["id"]}">{f["id"]}</a></td>'
+            H.append(f'<tr data-sev="{f["severity"]}" data-grp="{rule}"{fold_cls}><td><a href="#{f["id"]}">{f["id"]}</a></td>'
                      f'<td><span class="sev {f["severity"]}">{f["severity"]}</span></td>'
                      f'<td>{_h(f["title"])}</td><td><code>{html.escape(f["object"])}</code></td>'
                      f'<td>{f["evidence"]}</td></tr>')
@@ -624,7 +804,11 @@ def render_report_html(doc, findings, accepted_only):
                 H.append("</div>")
             prev_rule = f["rule"]
             n = sum(1 for x in live if x["rule"] == f["rule"])
-            H.append(f'<div class="group" data-grp="{f["rule"]}"><h3 class="grph" id="g-{f["rule"]}">'
+            folded = n > FOLD_OVER
+            fold_attr = ' class="group folded" hidden="until-found"' if folded else ' class="group"'
+            H.append(f'<div{fold_attr} data-grp="{f["rule"]}">'
+                     f'<h3 class="grph" id="g-{f["rule"]}"><span class="fold" data-fold="{f["rule"]}">'
+                     f'{"&#9656;" if folded else "&#9662;"}</span>'
                      f'{html.escape(rule_label(f["rule"]))} <span class="cnt">({n})</span></h3>')
         d = f.get("data") or {}
         H.append(f'<section class="finding {f["severity"]}" id="{f["id"]}" data-sev="{f["severity"]}">')
@@ -653,20 +837,18 @@ def render_report_html(doc, findings, accepted_only):
                 H.append(f'<tr><td class="n">{calls:,}</td><td class="n">{tot:,.0f}</td><td class="n">{mean:,.1f}</td>'
                          f'<td class="n">{sh}</td><td class="q"><code>{html.escape(short_query(q, 300))}</code></td></tr>')
             H.append("</table>")
-        if f["actions"]:
-            H.append('<div class="label">Changes</div><ul class="phases">')
-            by_phase = defaultdict(list)
-            for a in f["actions"]:
-                by_phase[a["phase"]].append(a)
-            for p in ["prepare", "create", "workload", "drop", "rewrite", "manual"]:
-                acts = by_phase.get(p)
-                if acts:
-                    notes = list(dict.fromkeys(a["note"] for a in acts if a.get("note")))
-                    cnt = f" &times;{len(acts)}" if len(acts) > 1 else ""
-                    H.append(f'<li><span class="ph">{html.escape(PHASE_LABEL[p])}</span>{cnt}'
-                             + (f": {_h('; '.join(notes))}" if notes else "") + "</li>")
-            H.append('</ul><details open><summary>SQL</summary><pre><code>'
-                     + html.escape(_sql_lines(f["actions"])) + "</code></pre></details>")
+        if differs(f):
+            H.append('<div class="sets">')
+            for p in PROFILES:
+                acts = profile_actions(f, p)
+                H.append(f'<div class="set {p}"><div class="label">{p.capitalize()} '
+                         f'<span class="pf">changes-{p}.sql</span></div><p>{_h(profile_text(f, p))}</p>')
+                H += _changes_html(acts) if acts else []
+                H.append("</div>")
+            H.append("</div>")
+        elif f["actions"]:
+            H.append('<div class="label">Changes <span class="pf">same in both sets</span></div>')
+            H += _changes_html(f["actions"])
         if f["needs_confirmation"]:
             H.append('<div class="label">Confirm</div><ul class="check">')
             H += [f"<li>{_h(q)}</li>" for q in f["needs_confirmation"]]
@@ -676,7 +858,7 @@ def render_report_html(doc, findings, accepted_only):
         H.append("</div>")
 
     if rejected:
-        H.append("<h2>Rejected in review (excluded from changes.sql)</h2><ul>")
+        H.append("<h2>Rejected in review (excluded from both change sets)</h2><ul>")
         H += [f"<li>{f['id']} <code>{f['rule']}</code> <code>{html.escape(f['object'])}</code>: "
               f"{_h(f.get('review_note') or 'no note')}</li>" for f in rejected]
         H.append("</ul>")
@@ -690,14 +872,14 @@ def render_report_html(doc, findings, accepted_only):
             grouped[q].append(f["id"])
     if grouped:
         H.append('<h2>Questions for the customer</h2><ul class="check">')
-        H += [f"<li>{_h(q)} <span class=\"sub\">({', '.join(ids)})</span></li>" for q, ids in grouped.items()]
+        H += [f"<li>{_h(q)} <span class=\"sub\">({_h(', '.join(ids))})</span></li>" for q, ids in grouped.items()]
         H.append("</ul>")
     if any(f["rule"] in ("redundant-index", "unused-index") for f in live):
         H.append('<h2>Before dropping any index</h2><ul class="check">'
                  "<li>No query hint (<code>pg_hint_plan</code> <code>IndexScan(t idx)</code>) or application code names it.</li>"
                  "<li>Usage counters were collected on <b>every</b> node (they are per node) over a full business cycle.</li>"
                  "<li>It doesn't back a constraint the application relies on (checked automatically for PK/UNIQUE/FK).</li>"
-                 "<li>Keep rollback.sql; drop one index at a time on busy systems and watch latency.</li></ul>")
+                 "<li>Keep the rollback file; drop one index at a time on busy systems and watch latency.</li></ul>")
     top = doc.get("top_statements") or []
     if top:
         H.append(f"<h2>Top {len(top)} statements by total time</h2><table class=\"stmts\"><tr><th>#</th><th>calls</th>"
@@ -723,14 +905,29 @@ REPORT_FORMATS = {"html": ("report.html", render_report_html), "md": ("report.md
 
 
 def render_all(doc, out, accepted_only=False, fmt="html"):
+    """Write the report and both change sets -> {profile: ({phase: count}, manual count)}."""
     os.makedirs(out, exist_ok=True)
     findings = sorted(doc["findings"], key=lambda f: f["id"])
-    for name, fn in (REPORT_FORMATS[fmt], ("changes.sql", render_changes),
-                     ("rollback.sql", render_rollback)):
+    name, fn = REPORT_FORMATS[fmt]
+    files = [(name, lambda: fn(doc, findings, accepted_only))]
+    for p in PROFILES:
+        files += [(f"changes-{p}.sql", lambda p=p: render_changes(doc, findings, accepted_only, p)),
+                  (f"rollback-{p}.sql", lambda p=p: render_rollback(doc, findings, accepted_only, p))]
+    for name, make in files:
         with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
-            fh.write(fn(doc, findings, accepted_only))
-    by_phase, manual, _ = plan(findings, accepted_only)
-    return {p: len(v) for p, v in by_phase.items()}, len(manual)
+            fh.write(make())
+    # single-set files from earlier versions: remove them, so nobody runs a stale set by habit
+    for old in ("changes.sql", "rollback.sql"):
+        path = os.path.join(out, old)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                if fh.readline().startswith("-- YugabyteDB schema review:"):
+                    os.remove(path)
+    result = {}
+    for p in PROFILES:
+        by_phase, manual, _ = plan(findings, accepted_only, p)
+        result[p] = ({ph: len(v) for ph, v in by_phase.items()}, len(manual))
+    return result
 
 
 def main():
@@ -746,9 +943,11 @@ def main():
     if doc.get("format") != "yb-schema-review/findings/v1":
         sys.exit("not a yb-schema-review/findings/v1 file")
     out = args.out or os.path.dirname(os.path.abspath(args.findings))
-    phases, n_manual = render_all(doc, out, args.accepted_only, args.format)
-    print(f"changes.sql: {', '.join(f'{p} {n}' for p, n in phases.items()) or 'no changes'}, "
-          f"{n_manual} manual → {out}/{REPORT_FORMATS[args.format][0]}, changes.sql, rollback.sql")
+    sets = render_all(doc, out, args.accepted_only, args.format)
+    for p, (phases, n_manual) in sets.items():
+        print(f"changes-{p}.sql: {', '.join(f'{ph} {n}' for ph, n in phases.items()) or 'no changes'}, "
+              f"{n_manual} manual")
+    print(f"→ {out}/{REPORT_FORMATS[args.format][0]}, changes-{{minimal,ideal}}.sql, rollback-{{minimal,ideal}}.sql")
 
 
 if __name__ == "__main__":

@@ -40,28 +40,32 @@ Review an existing database with read-only scripts and an offline analyzer:
 scripts/collect.sh -h <host> -d <db> -U <readonly_user> -o bundle [--sslrootcert ca.crt]
 
 # offline: analyze a bundle (no DB connection; stdlib Python 3.8+)
-python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.html, changes.sql, rollback.sql
+python3 scripts/analyze.py bundle      # -> bundle/review/findings.json, report.html,
+                                       #    changes-{minimal,ideal}.sql, rollback-{minimal,ideal}.sql
 python3 scripts/analyze.py bundle --database appdb   # statements file covering several databases
                                        #    --format md writes report.md instead of report.html
 
 # offline with only the DDL (ysql_dump --schema-only --include-yb-metadata, or a migration script)
 python3 scripts/analyze.py schema.sql  # -> review/ next to schema.sql
 
-# after triage (status / review_note / edited SQL in findings.json): re-render report + SQL
+# after triage (status / review_note / profile / edited SQL in findings.json): re-render report + SQL
 python3 scripts/render.py bundle/review/findings.json
 
-# apply one phase at a time
-ysqlsh -d <db> -v phase=create -f bundle/review/changes.sql   # prepare | create | workload | drop | rewrite
+# apply ONE change set, one phase at a time: minimal (access paths, waste) or ideal (also hot spots)
+ysqlsh -d <db> -v phase=create -f bundle/review/changes-minimal.sql   # prepare | create | workload | drop | rewrite
 ```
 
 Checks include HASH-sharded date/time key columns, redundant and unused indexes, range "twins" of a
 HASH primary key, low-cardinality, NULL-heavy or skewed HASH keys, monotonic range keys, per-value write tails, single-tablet range
-indexes, partial-index pitfalls, missing or mistyped FK indexes, tables without a PK,
+indexes, partial indexes keyed on their own predicate column, other partial-index pitfalls, missing or mistyped FK indexes, tables without a PK,
 scan-heavy statements, and statements whose filters no index serves (no leading index column,
 part of a HASH key bound, range or sort on a HASH column, or a partly used index), weighted by
 calls, total and mean time. Each finding carries an evidence level (schema / stats / workload). The
-analyzer never runs DDL. Every change in the report is written to `changes.sql` (phased:
-prepare → create → workload → drop → rewrite, idempotent) with a matching `rollback.sql`. See
+analyzer never runs DDL. Every change in the report is written to two change sets, each phased
+(prepare → create → workload → drop → rewrite), idempotent and with a matching rollback:
+`changes-minimal.sql` fixes access paths and waste, and `changes-ideal.sql` also removes write
+hot spots (bucket prefixes, HASHing monotonic keys); the report shows both variants wherever they
+differ. See
 [`review-mode.md`](references/review-mode.md) for the customer-side commands, schema-only replay,
 the accepted statements formats, and the rollout runbook.
 
@@ -76,7 +80,8 @@ the accepted statements formats, and the rollout runbook.
 - ✅ Lead with a low-cardinality or skewed column (few tenants) as range (`ASC`), not `HASH`: it splits inside a value; check `pg_stats`, else follow the schema's existing pattern
 - ✅ `INCLUDE` the primary key columns a query selects: the PK in an index entry is encoded and not readable
 - ✅ Index every foreign key column in child tables (a PK whose leading column is the FK counts)
-- ✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate
+- ✅ Use partial indexes for nullable or skewed columns, keyed on columns other than the predicate (never `(deleted_at) WHERE deleted_at IS NULL`)
+- ✅ Bucket inside a low-cardinality value when a growing timestamp follows it, hashing the primary key: `(status ASC, (yb_hash_code(id) % 3) ASC, created_at ASC)`
 - ✅ Match FK column types exactly (`INT` vs `BIGINT` matters)
 - ✅ Drop redundant indexes (key prefix, wider index's HASH columns inside it, same predicate, uniqueness kept)
 - ✅ Keep one copy of a key: a range index on exactly the HASH PK's columns (`(tenant_id, id) HASH` + `(tenant_id ASC, id ASC)`) doubles every write; reshape the PK (leading column by stats, else the existing pattern) and drop the index, or drop the index if every query binds the full key
@@ -111,7 +116,7 @@ yugabytedb-schema-design/
     ├── export-stats.sql   # Catalog + pg_stats -> stats.json
     ├── export-usage.sql   # Per-node usage + pg_stat_statements -> usage/<node>.json
     ├── analyze.py         # Offline analyzer -> findings.json (+ render)
-    ├── render.py          # findings.json -> report.html|md, changes.sql, rollback.sql
+    ├── render.py          # findings.json -> report.html|md, changes-/rollback-{minimal,ideal}.sql
     ├── schema_sql.py      # schema.sql -> catalog, for schema-only review
     └── checks/
         ├── hash_on_range_type.sql  # HASH key columns of date/time types
